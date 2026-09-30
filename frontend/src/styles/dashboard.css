@@ -4301,3 +4301,356 @@ footer {
         font-size: 24px;
     }
 }
+
+.long-deals-page {
+    min-height: calc(100vh - 120px);
+    padding: 30px;
+    background: #07152f;
+    color: #ffffff;
+}
+
+.long-deals-header {
+    margin-bottom: 24px;
+}
+
+.long-deals-header h1 {
+    margin: 0;
+    font-size: 28px;
+    font-weight: 700;
+}
+
+.long-deals-header p {
+    margin-top: 8px;
+    color: #8f98a3;
+    font-size: 14px;
+}
+
+.long-deals-card {
+    background: #11161d;
+    border: 1px solid #252c35;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.long-deals-card-header {
+    padding: 18px 20px;
+    border-bottom: 1px solid #252c35;
+}
+
+.long-deals-card-header h2 {
+    margin: 0;
+    font-size: 18px;
+}
+
+.long-deals-table-wrapper {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.long-deals-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.long-deals-table th {
+    padding: 14px 16px;
+    text-align: left;
+    font-size: 12px;
+    color: #8f98a3;
+    font-weight: 600;
+    background: #0e1319;
+    border-bottom: 1px solid #252c35;
+}
+
+.long-deals-table td {
+    padding: 15px 16px;
+    border-bottom: 1px solid #1e252d;
+    font-size: 14px;
+}
+
+.long-deals-empty {
+    text-align: center;
+    padding: 40px !important;
+    color: #737d89;
+}
+
+
+.long-deals-page {
+    min-height: calc(100vh - 120px);
+    padding: 30px;
+    background: #07152f;
+    color: #ffffff;
+}
+
+
+/* =========================================================
+   HEADER
+========================================================= */
+
+.long-deals-header {
+    margin-bottom: 18px;
+}
+
+.long-deals-header h1 {
+    margin: 0;
+    font-size: 28px;
+    font-weight: 700;
+}
+
+.long-deals-header p {
+    margin: 7px 0 0;
+    color: #8f98a3;
+    font-size: 14px;
+}
+
+
+/* =========================================================
+   TABS
+========================================================= */
+
+.long-deals-tabs {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+
+    border-bottom: 1px solid #303740;
+
+    margin-bottom: 18px;
+}
+
+.long-deals-tab {
+    position: relative;
+
+    border: none;
+    background: transparent;
+
+    color: #a7afb9;
+
+    padding: 13px 20px;
+
+    font-size: 14px;
+    font-weight: 500;
+
+    cursor: pointer;
+
+    transition:
+        color 0.2s ease,
+        background 0.2s ease;
+}
+
+.long-deals-tab:hover {
+    color: #ffffff;
+}
+
+.long-deals-tab.active {
+    color: #ffffff;
+}
+
+.long-deals-tab.active::after {
+    content: "";
+
+    position: absolute;
+
+    left: 0;
+    right: 0;
+    bottom: -1px;
+
+    height: 3px;
+
+    background: #f06b2f;
+
+    border-radius: 3px 3px 0 0;
+}
+
+
+/* =========================================================
+   CARD
+========================================================= */
+
+.long-deals-card {
+    background: #11161d;
+
+    border: 1px solid #252c35;
+
+    border-radius: 10px;
+
+    overflow: hidden;
+}
+
+
+/* =========================================================
+   CARD HEADER
+========================================================= */
+
+.long-deals-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    padding: 16px 18px;
+
+    border-bottom: 1px solid #252c35;
+}
+
+.long-deals-card-header h2 {
+    margin: 0;
+
+    font-size: 14px;
+    font-weight: 600;
+
+    color: #ffffff;
+}
+
+.long-deals-source {
+    font-size: 12px;
+
+    padding: 4px 9px;
+
+    border-radius: 5px;
+
+    background: rgba(72, 55, 146, 0.25);
+
+    color: #a99cf4;
+}
+
+
+/* =========================================================
+   TABLE
+========================================================= */
+
+.long-deals-table-wrapper {
+    width: 100%;
+    overflow-x: auto;
+}
+
+.long-deals-table {
+    width: 100%;
+    min-width: 1000px;
+
+    border-collapse: collapse;
+}
+
+.long-deals-table th {
+    padding: 13px 14px;
+
+    text-align: left;
+
+    font-size: 11px;
+    font-weight: 700;
+
+    color: #ffffff;
+
+    background: #403487;
+
+    border-right: 1px solid rgba(255, 255, 255, 0.05);
+
+    white-space: nowrap;
+}
+
+.long-deals-table td {
+    padding: 12px 14px;
+
+    font-size: 13px;
+
+    color: #d5d9de;
+
+    border-bottom: 1px solid #252c35;
+
+    vertical-align: middle;
+}
+
+.long-deals-table tbody tr:hover {
+    background: #171d25;
+}
+
+
+/* =========================================================
+   SYMBOL
+========================================================= */
+
+.deal-symbol {
+    color: #62a8ff !important;
+
+    font-weight: 500;
+
+    cursor: pointer;
+}
+
+
+/* =========================================================
+   BUY / SELL
+========================================================= */
+
+.deal-buy {
+    color: #36c98f !important;
+
+    font-weight: 600;
+}
+
+.deal-sell {
+    color: #ff7b72 !important;
+
+    font-weight: 600;
+}
+
+
+/* =========================================================
+   EMPTY / LOADING
+========================================================= */
+
+.long-deals-empty {
+    text-align: center;
+
+    padding: 45px !important;
+
+    color: #737d89 !important;
+}
+
+.long-deals-status {
+    padding: 50px;
+
+    text-align: center;
+
+    color: #8f98a3;
+
+    font-size: 14px;
+}
+
+.long-deals-error {
+    padding: 14px 18px;
+
+    color: #ff8a80;
+
+    background: rgba(255, 80, 70, 0.08);
+
+    border-bottom: 1px solid
+        rgba(255, 80, 70, 0.2);
+
+    font-size: 13px;
+}
+
+
+/* =========================================================
+   MOBILE
+========================================================= */
+
+@media (max-width: 768px) {
+
+    .long-deals-page {
+        padding: 20px 14px;
+    }
+
+    .long-deals-header h1 {
+        font-size: 24px;
+    }
+
+    .long-deals-tab {
+        padding: 12px 12px;
+
+        font-size: 12px;
+    }
+
+    .long-deals-table {
+        min-width: 900px;
+    }
+}

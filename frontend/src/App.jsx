@@ -17,6 +17,7 @@ import {
 
 import Header from "./components/Header";
 import Scanner from "./components/Scanner";
+import LongDeals from "./components/LongDeals";
 
 
 import LayersPanel from "./components/LayersPanel";
@@ -801,11 +802,36 @@ function MarketApp({ session, onLogout }) {
                     onStockChange={handleStockChange}
                     onTimeframeChange={handleTimeframeChange}
                     onToggleLayers={handleToggleLayers}
-                                    session={session}
+                    session={session}
                     onLogout={onLogout}
                 />
 
                 <Scanner />
+            </>
+        );
+    }
+
+    if (activePage === "longDeals") {
+        return (
+            <>
+                <Header
+                    selectedStock={selectedStock}
+                    activePage={activePage}
+                    onNavigate={handleNavigate}
+                    currentTF={currentTF}
+                    stocks={stocks}
+                    stockData={stockData}
+                    dataVersion={dataVersion}
+                    marketQuotes={marketQuotes}
+                    marketIndices={marketIndices}
+                    onStockChange={handleStockChange}
+                    onTimeframeChange={handleTimeframeChange}
+                    onToggleLayers={handleToggleLayers}
+                    session={session}
+                    onLogout={onLogout}
+                />
+
+                <LongDeals />
             </>
         );
     }
@@ -831,9 +857,9 @@ function MarketApp({ session, onLogout }) {
                 onStockChange={handleStockChange}
                 onTimeframeChange={handleTimeframeChange}
                 onToggleLayers={handleToggleLayers}
-                                session={session}
-                    onLogout={onLogout}
-                />
+                session={session}
+                onLogout={onLogout}
+            />
 
 
 

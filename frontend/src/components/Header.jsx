@@ -15,7 +15,7 @@ function Header({
 
 
   console.log("🔥 HEADER stockData:", stockData);
-console.log("🔥 HEADER stockData keys:", Object.keys(stockData || {}));
+  console.log("🔥 HEADER stockData keys:", Object.keys(stockData || {}));
   const [search, setSearch] = useState("");
 
   // ---------------------------------------------------------
@@ -81,6 +81,7 @@ console.log("🔥 HEADER stockData keys:", Object.keys(stockData || {}));
     "Markets",
     "Screeners",
     "Insider Trades",
+    "Long Deals"
   ];
 
   /*
@@ -200,8 +201,8 @@ console.log("🔥 HEADER stockData keys:", Object.keys(stockData || {}));
 
     const change =
       Number.isFinite(price) &&
-      Number.isFinite(previousClose) &&
-      previousClose > 0
+        Number.isFinite(previousClose) &&
+        previousClose > 0
         ? price - previousClose
         : null;
 
@@ -324,6 +325,11 @@ console.log("🔥 HEADER stockData keys:", Object.keys(stockData || {}));
 
                 if (item === "Markets") {
                   onNavigate?.("dashboard");
+                  return;
+                }
+
+                if (item === "Long Deals") {
+                  onNavigate?.("longDeals");
                   return;
                 }
 

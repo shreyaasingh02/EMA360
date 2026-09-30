@@ -5660,6 +5660,406 @@ app.get("/api/scanner/nse/stocks", async (req, res) => {
         });
     }
 });
+
+/* =========================================================
+   NSE LARGE DEALS
+   ---------------------------------------------------------
+   Sources:
+   - Bulk Deals
+   - Block Deals
+   - Short Selling
+
+   This is completely separate from:
+   - Angel One live stream
+   - NSE market quotes
+   - NSE candles
+   - Scanner
+========================================================= */
+
+const NSE_LARGE_DEALS_CACHE = {
+    timestamp: 0,
+    data: null
+};
+
+const NSE_LARGE_DEALS_CACHE_MS = 60 * 1000;
+
+let NSE_LARGE_DEALS_INFLIGHT = null;
+
+
+/*
+ * ---------------------------------------------------------
+ * NSE LARGE DEALS HEADERS
+ * ---------------------------------------------------------
+ */
+
+function nseLargeDealsHeaders() {
+    return {
+        "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
+
+        "Accept":
+            "application/json,text/plain,*/*",
+
+        "Accept-Language":
+            "en-US,en;q=0.9",
+
+        "Referer":
+            "https://www.nseindia.com/report-detail/display-bulk-and-block-deals",
+
+        "Connection":
+            "keep-alive"
+    };
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * NORMALIZE LARGE DEAL ROW
+ * ---------------------------------------------------------
+ */
+
+function normalizeNseLargeDealRow(row = {}) {
+
+    return {
+        date:
+            row?.date ??
+            row?.DATE ??
+            null,
+
+        symbol:
+            row?.symbol ??
+            row?.SYMBOL ??
+            null,
+
+        securityName:
+            row?.name ??
+            row?.securityName ??
+            row?.SECURITY_NAME ??
+            null,
+
+        clientName:
+            row?.clientName ??
+            row?.CLIENT_NAME ??
+            null,
+
+        buySell:
+            row?.buySell ??
+            row?.BUY_SELL ??
+            row?.buy_sell ??
+            null,
+
+        quantity:
+            row?.qty ??
+            row?.quantity ??
+            row?.QUANTITY ??
+            null,
+
+        price:
+            row?.watp ??
+            row?.price ??
+            row?.PRICE ??
+            null,
+
+        remarks:
+            row?.remarks ??
+            row?.REMARKS ??
+            null
+    };
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * NORMALIZE SHORT SELLING ROW
+ * ---------------------------------------------------------
+ */
+
+function normalizeNseShortSellingRow(row = {}) {
+
+    return {
+        date:
+            row?.date ??
+            row?.DATE ??
+            null,
+
+        symbol:
+            row?.symbol ??
+            row?.SYMBOL ??
+            null,
+
+        securityName:
+            row?.name ??
+            row?.securityName ??
+            row?.SECURITY_NAME ??
+            null,
+
+        quantity:
+            row?.qty ??
+            row?.quantity ??
+            row?.QUANTITY ??
+            null,
+
+        clientName:
+            row?.clientName ??
+            row?.CLIENT_NAME ??
+            null,
+
+        remarks:
+            row?.remarks ??
+            row?.REMARKS ??
+            null
+    };
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * FETCH NSE LARGE DEALS
+ * ---------------------------------------------------------
+ */
+
+async function fetchNseLargeDeals() {
+
+    const now = Date.now();
+
+
+    /*
+     * Return cached data for 60 seconds.
+     * This prevents unnecessary requests to NSE.
+     */
+
+    if (
+        NSE_LARGE_DEALS_CACHE.data &&
+        now - NSE_LARGE_DEALS_CACHE.timestamp <
+            NSE_LARGE_DEALS_CACHE_MS
+    ) {
+
+        return NSE_LARGE_DEALS_CACHE.data;
+
+    }
+
+
+    /*
+     * If another request is already fetching the same
+     * NSE data, wait for that request instead of creating
+     * another NSE request.
+     */
+
+    if (NSE_LARGE_DEALS_INFLIGHT) {
+
+        return NSE_LARGE_DEALS_INFLIGHT;
+
+    }
+
+
+    NSE_LARGE_DEALS_INFLIGHT = (async () => {
+
+        try {
+
+            const url =
+                "https://www.nseindia.com/api/snapshot-capital-market-largedeal";
+
+
+            const response = await axios.get(
+                url,
+                {
+                    headers:
+                        nseLargeDealsHeaders(),
+
+                    timeout:
+                        15000
+                }
+            );
+
+
+            const payload =
+                response?.data || {};
+
+
+            /*
+             * NSE provides these three arrays.
+             */
+
+            const bulkDeals =
+                Array.isArray(
+                    payload?.BULK_DEALS_DATA
+                )
+                    ? payload.BULK_DEALS_DATA
+                    : [];
+
+
+            const blockDeals =
+                Array.isArray(
+                    payload?.BLOCK_DEALS_DATA
+                )
+                    ? payload.BLOCK_DEALS_DATA
+                    : [];
+
+
+            const shortSelling =
+                Array.isArray(
+                    payload?.SHORT_DEALS_DATA
+                )
+                    ? payload.SHORT_DEALS_DATA
+                    : [];
+
+
+            const result = {
+
+                source: "NSE",
+
+                asOnDate:
+                    payload?.as_on_date ??
+                    payload?.AS_ON_DATE ??
+                    null,
+
+                bulkDeals:
+                    bulkDeals.map(
+                        normalizeNseLargeDealRow
+                    ),
+
+                blockDeals:
+                    blockDeals.map(
+                        normalizeNseLargeDealRow
+                    ),
+
+                shortSelling:
+                    shortSelling.map(
+                        normalizeNseShortSellingRow
+                    ),
+
+                counts: {
+
+                    bulkDeals:
+                        bulkDeals.length,
+
+                    blockDeals:
+                        blockDeals.length,
+
+                    shortSelling:
+                        shortSelling.length
+
+                },
+
+                timestamp:
+                    new Date().toISOString()
+
+            };
+
+
+            /*
+             * Save in cache.
+             */
+
+            NSE_LARGE_DEALS_CACHE.timestamp =
+                Date.now();
+
+            NSE_LARGE_DEALS_CACHE.data =
+                result;
+
+
+            return result;
+
+        }
+
+        catch (error) {
+
+            console.error(
+                "❌ NSE Large Deals fetch failed:",
+                error?.response?.status ||
+                error?.message ||
+                error
+            );
+
+
+            throw error;
+
+        }
+
+        finally {
+
+            NSE_LARGE_DEALS_INFLIGHT =
+                null;
+
+        }
+
+    })();
+
+
+    return NSE_LARGE_DEALS_INFLIGHT;
+
+}
+
+
+/*
+ * ---------------------------------------------------------
+ * NSE LARGE DEALS API
+ * ---------------------------------------------------------
+ */
+
+app.get(
+    "/api/market/nse/large-deals",
+    async (req, res) => {
+
+        try {
+
+            const deals =
+                await fetchNseLargeDeals();
+
+
+            return res.json({
+
+                success: true,
+
+                source: "NSE",
+
+                ...deals
+
+            });
+
+        }
+
+        catch (error) {
+
+            console.error(
+                "❌ NSE Large Deals route failed:",
+                error?.message ||
+                error
+            );
+
+
+            return res.status(502).json({
+
+                success: false,
+
+                source: "NSE",
+
+                message:
+                    error?.message ||
+                    "NSE Large Deals data unavailable",
+
+                bulkDeals: [],
+
+                blockDeals: [],
+
+                shortSelling: [],
+
+                counts: {
+
+                    bulkDeals: 0,
+
+                    blockDeals: 0,
+
+                    shortSelling: 0
+
+                }
+
+            });
+
+        }
+
+    }
+);
 /* =========================================================
    START SERVER
 ========================================================= */
