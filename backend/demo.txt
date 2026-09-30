@@ -1,0 +1,1 @@
+https://ema360-dashboard.onrender.com/auth/callback

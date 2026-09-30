@@ -1,0 +1,5725 @@
+require("dotenv").config();
+const axios = require("axios");
+
+const { NseIndia } = require("stock-nse-india");
+
+const nseIndia = new NseIndia();
+// Cache NSE symbols and tokens so we don't repeatedly fetch them
+let NSE_STOCKS_CACHE = [];
+const NSE_TOKEN_CACHE = new Map();
+
+// ============================================================
+// NSE SCANNER PRIORITY CACHE
+// ============================================================
+
+let NSE_PRIORITY_CACHE = [];
+let NSE_PRIORITY_CACHE_TIME = 0;
+let NSE_PRIORITY_INFLIGHT = null;
+
+// Keep the priority snapshot for 5 minutes.
+// We do NOT want to rebuild the entire NSE ranking for every scan.
+const NSE_PRIORITY_CACHE_TTL_MS = 5 * 60 * 1000;
+
+const express = require("express");
+const { SmartAPI, WebSocketV2 } = require("smartapi-javascript");
+const { generate } = require("otplib");
+
+const app = express();
+
+const cors = require("cors");
+
+app.use(
+    cors({
+        origin: "http://localhost:5173"
+    })
+);
+
+// Scanner Magic Filters / Backtest / Alerts send JSON bodies.
+app.use(express.json({ limit: "1mb" }));
+
+const clients = new Set();
+
+let latestTicks = {};
+let instrumentMaster = [];
+let symbolTokens = {};
+
+/* =========================================================
+   STEP 1 — HISTORICAL DATA CACHE + RATE-LIMITED QUEUE
+
+   Goals:
+   1. Do not repeatedly request the same historical data.
+   2. Share one request when multiple browser requests arrive together.
+   3. Keep Angel One candle requests spaced out.
+   4. Keep ONE Angel One WebSocket for live data.
+========================================================= */
+
+const historicalCache = new Map();
+const historicalInFlight = new Map();
+
+const HISTORICAL_CACHE_TTL_MS = 0;
+
+
+// =========================================================
+// HISTORICAL REQUEST QUEUE
+// =========================================================
+
+// Keep historical requests strictly one-at-a-time.
+// 500ms = maximum 2 requests/sec.
+const ANGEL_CANDLE_MIN_INTERVAL_MS = 1000;
+
+let historicalRequestQueue = Promise.resolve();
+let lastAngelCandleRequestAt = 0;
+
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+function enqueueHistoricalRequest(requestFunction) {
+
+    const queuedRequest =
+        historicalRequestQueue.then(async () => {
+
+            const elapsed =
+                Date.now() - lastAngelCandleRequestAt;
+
+            const wait =
+                Math.max(
+                    0,
+                    ANGEL_CANDLE_MIN_INTERVAL_MS - elapsed
+                );
+
+            if (wait > 0) {
+                await sleep(wait);
+            }
+
+            lastAngelCandleRequestAt =
+                Date.now();
+
+            return requestFunction();
+        });
+
+
+    // Keep the queue alive even if one request fails.
+    historicalRequestQueue =
+        queuedRequest.catch(() => { });
+
+
+    return queuedRequest;
+}
+
+
+function historicalCacheKey(
+    stock,
+    timeframe
+) {
+    return `${stock}::${timeframe}`;
+}
+
+
+/* =========================================================
+   ANGEL ONE
+========================================================= */
+
+const smartApi = new SmartAPI({
+    api_key: process.env.ANGEL_API_KEY
+});
+
+
+/* =========================================================
+   NIFTY 50 STOCK LIST
+========================================================= */
+
+const stocks = [
+    "NIFTY 50",
+    "ADANIENT",
+    "ADANIPORTS",
+    "APOLLOHOSP",
+    "ASIANPAINT",
+    "AXISBANK",
+    "BAJAJ-AUTO",
+    "BAJFINANCE",
+    "BAJAJFINSV",
+    "BEL",
+    "BHARTIARTL",
+    "CIPLA",
+    "COALINDIA",
+    "DRREDDY",
+    "EICHERMOT",
+    "ETERNAL",
+    "GRASIM",
+    "HCLTECH",
+    "HDFCBANK",
+    "HDFCLIFE",
+    "HEROMOTOCO",
+    "HINDALCO",
+    "HINDUNILVR",
+    "ICICIBANK",
+    "INDUSINDBK",
+    "INFY",
+    "ITC",
+    "JIOFIN",
+    "JSWSTEEL",
+    "KOTAKBANK",
+    "LT",
+    "M&M",
+    "MARUTI",
+    "MAXHEALTH",
+    "NESTLEIND",
+    "NTPC",
+    "ONGC",
+    "POWERGRID",
+    "RELIANCE",
+    "SBILIFE",
+    "SBIN",
+    "SHRIRAMFIN",
+    "SUNPHARMA",
+    "TATACONSUM",
+    "TATAMOTORS",
+    "TATASTEEL",
+    "TCS",
+    "TECHM",
+    "TITAN",
+    "TRENT",
+    "ULTRACEMCO"
+];
+
+
+/* =========================================================
+   INSTRUMENT MASTER
+========================================================= */
+
+async function loadInstrumentMaster() {
+
+    console.log(
+        "📚 Loading Angel One instrument master..."
+    );
+
+    const response = await fetch(
+        "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    );
+
+    if (!response.ok) {
+
+        throw new Error(
+            `Instrument master failed: ${response.status}`
+        );
+    }
+
+    instrumentMaster =
+        await response.json();
+
+
+
+    console.log(
+        `📚 Instrument master loaded: ${instrumentMaster.length} instruments`
+    );
+
+
+    /*
+       NIFTY 50 index
+    */
+
+    symbolTokens["NIFTY 50"] = {
+        token: "99926000",
+        exchange: "NSE",
+        tradingsymbol: "NIFTY"
+    };
+
+
+    /*
+       NSE equity stocks
+    */
+
+    for (const stock of stocks) {
+
+        if (stock === "NIFTY 50") {
+            continue;
+        }
+
+        const instrument =
+            instrumentMaster.find(item =>
+
+                String(item.exch_seg)
+                    .toUpperCase() === "NSE"
+
+                &&
+
+                String(item.symbol)
+                    .toUpperCase() ===
+                `${stock}-EQ`.toUpperCase()
+            );
+
+
+        if (!instrument) {
+
+            console.warn(
+                `⚠️ Token not found for ${stock}`
+            );
+
+            continue;
+        }
+
+
+        symbolTokens[stock] = {
+
+            token:
+                String(instrument.token),
+
+            exchange:
+                "NSE",
+
+            tradingsymbol:
+                instrument.symbol
+
+        };
+    }
+
+
+    /*
+       Print token map
+    */
+
+    console.log(
+        "\n🔑 NIFTY 50 TOKEN MAP:"
+    );
+
+
+    for (const stock of stocks) {
+
+        if (symbolTokens[stock]) {
+
+            console.log(
+                `${stock} → ${symbolTokens[stock].token}`
+            );
+
+        } else {
+
+            console.log(
+                `${stock} → ❌ NOT FOUND`
+            );
+        }
+    }
+
+
+    console.log("");
+}
+
+
+/* =========================================================
+   DATE HELPERS
+========================================================= */
+
+function formatDateIST(date) {
+
+    const parts =
+        new Intl.DateTimeFormat(
+            "en-CA",
+            {
+                timeZone: "Asia/Kolkata",
+
+                year: "numeric",
+                month: "2-digit",
+                day: "2-digit"
+            }
+        ).formatToParts(date);
+
+
+    const values = {};
+
+
+    for (const part of parts) {
+
+        values[part.type] =
+            part.value;
+    }
+
+
+    return (
+        `${values.year}-${values.month}-${values.day}`
+    );
+}
+
+
+function getTodayRange() {
+
+    const date =
+        formatDateIST(
+            new Date()
+        );
+
+
+    return {
+
+        fromdate:
+            `${date} 09:15`,
+
+        todate:
+            `${date} 15:30`
+
+    };
+}
+
+
+/* =========================================================
+   CANDLE CONVERTER
+========================================================= */
+
+function convertCandles(data) {
+
+    if (!Array.isArray(data)) {
+        return [];
+    }
+
+    const candles = data
+        .map(candle => ({
+            time: candle[0],
+            o: Number(candle[1]),
+            h: Number(candle[2]),
+            l: Number(candle[3]),
+            c: Number(candle[4]),
+            v: Number(candle[5])
+        }))
+        .filter(candle =>
+            candle.time &&
+            Number.isFinite(candle.o) &&
+            Number.isFinite(candle.h) &&
+            Number.isFinite(candle.l) &&
+            Number.isFinite(candle.c) &&
+            Number.isFinite(candle.v)
+        );
+
+    /*
+     * ALWAYS chronological.
+     */
+
+    candles.sort(
+        (a, b) =>
+            new Date(a.time).getTime() -
+            new Date(b.time).getTime()
+    );
+
+    /*
+     * Remove duplicate timestamps.
+     */
+
+    const unique = [];
+    const seen = new Set();
+
+    for (const candle of candles) {
+
+        const key =
+            String(candle.time);
+
+        if (seen.has(key)) {
+            continue;
+        }
+
+        seen.add(key);
+        unique.push(candle);
+    }
+
+    return unique;
+}
+
+
+/* =========================================================
+   HISTORICAL DATA
+========================================================= */
+
+async function getHistoricalCandles(
+    stock,
+    timeframe
+) {
+
+    const instrument =
+        symbolTokens[stock];
+
+
+    if (!instrument) {
+
+        throw new Error(
+            `No Angel One token found for ${stock}`
+        );
+    }
+
+
+    /*
+       Angel One supported intervals.
+
+       4H / 1W / 1Month are constructed
+       from lower timeframes.
+    */
+
+    /*
+   Angel One supported intervals ONLY.
+
+   These timeframes are passed directly to Angel One.
+   EMA360 does NOT create/aggregate its own historical candles.
+*/
+    const timeframeConfig = {
+
+        "1M": {
+            interval: "ONE_MINUTE",
+            days: 30
+        },
+
+        "3M": {
+            interval: "THREE_MINUTE",
+            days: 60
+        },
+
+        "5M": {
+            interval: "FIVE_MINUTE",
+            days: 100
+        },
+
+        "15M": {
+            interval: "FIFTEEN_MINUTE",
+            days: 200
+        },
+
+        "30M": {
+            interval: "THIRTY_MINUTE",
+            days: 200
+        },
+
+        "1H": {
+            interval: "ONE_HOUR",
+            days: 400
+        },
+
+        "1D": {
+            interval: "ONE_DAY",
+            days: 2000
+        }
+
+    };
+
+
+    const config =
+        timeframeConfig[timeframe];
+
+
+    if (!config) {
+
+        throw new Error(
+            `Unsupported timeframe: ${timeframe}`
+        );
+    }
+
+
+    /* =====================================================
+       CACHE CHECK
+    ===================================================== */
+
+    const key =
+        historicalCacheKey(
+            stock,
+            timeframe
+        );
+
+
+    const cached =
+        historicalCache.get(key);
+
+
+    if (
+        cached &&
+
+        Date.now() -
+        cached.cachedAt
+        <
+        HISTORICAL_CACHE_TTL_MS
+    ) {
+
+        console.log(
+            `♻️ CACHE HIT ${stock} ${timeframe} (${cached.data.length} candles)`
+        );
+
+        return cached.data;
+    }
+
+
+    /* =====================================================
+       IN-FLIGHT REQUEST CHECK
+
+       If two browser components request:
+
+       RELIANCE + 5M
+
+       at the same time,
+
+       only ONE Angel One request is made.
+    ===================================================== */
+
+    if (
+        historicalInFlight.has(key)
+    ) {
+
+        console.log(
+            `⏳ SHARING IN-FLIGHT REQUEST ${stock} ${timeframe}`
+        );
+
+        return historicalInFlight.get(key);
+    }
+
+
+    /* =====================================================
+       CREATE ONE REQUEST
+    ===================================================== */
+
+    const requestPromise =
+        (async () => {
+
+            try {
+
+                const toDate = new Date();
+
+                // If today is Saturday or Sunday,
+                // use the previous Friday as the latest trading day.
+                const day = toDate.getDay();
+
+                if (day === 6) {
+                    toDate.setDate(toDate.getDate() - 1);
+                } else if (day === 0) {
+                    toDate.setDate(toDate.getDate() - 2);
+                }
+
+                const fromDate = new Date();
+
+                fromDate.setDate(
+                    fromDate.getDate() -
+                    config.days
+                );
+
+                const fromdate =
+                    `${formatDateIST(fromDate)} 09:15`;
+
+                const todate =
+                    `${formatDateIST(toDate)} 15:30`;
+
+
+                console.log(
+                    `📊 Angel One request ${stock} ${timeframe} (${config.interval})`
+                );
+
+
+                console.log(
+                    `   From: ${fromdate}`
+                );
+
+
+                console.log(
+                    `   To:   ${todate}`
+                );
+
+
+                /*
+                   Rate-limit protection.
+                */
+
+
+                let response = null;
+
+                for (let attempt = 1; attempt <= 3; attempt++) {
+
+                    response =
+                        await enqueueHistoricalRequest(
+                            () =>
+                                smartApi.getCandleData({
+
+                                    exchange:
+                                        instrument.exchange,
+
+                                    symboltoken:
+                                        instrument.token,
+
+                                    interval:
+                                        config.interval,
+
+                                    fromdate,
+
+                                    todate
+
+                                })
+                        );
+
+
+                    // SUCCESS
+                    if (
+                        response &&
+                        response.status === true &&
+                        Array.isArray(response.data)
+                    ) {
+                        break;
+                    }
+
+
+                    // RATE LIMIT / 403
+                    if (
+                        response?.status === 403 ||
+                        response?.errorcode === "AB1021" ||
+                        response?.message === "Too many requests"
+                    ) {
+
+                        const retryDelay =
+                            attempt * 2000;
+
+                        console.warn(
+                            `⚠️ Angel One rate limit for ${stock} ${timeframe}. ` +
+                            `Retry ${attempt}/3 after ${retryDelay}ms`
+                        );
+
+                        await sleep(retryDelay);
+
+                        continue;
+                    }
+
+
+                    // Any other error → don't retry
+                    break;
+                }
+
+
+                if (
+                    !response ||
+                    !response.status ||
+                    !Array.isArray(response.data)
+                ) {
+
+                    console.error("❌ ANGEL ONE RAW RESPONSE:", response);
+
+                    console.error("❌ FAILED CANDLE REQUEST:", {
+                        stock,
+                        token: instrument.token,
+                        exchange: instrument.exchange,
+                        interval: config.interval,
+                        fromdate,
+                        todate
+                    });
+
+
+                    throw new Error(
+                        response?.message ||
+                        `No historical data for ${stock}`
+                    );
+                }
+
+
+                const result =
+                    convertCandles(
+                        response.data
+                    );
+
+
+                /*
+                   Save to cache.
+                */
+
+                historicalCache.set(
+                    key,
+                    {
+
+                        data:
+                            result,
+
+                        cachedAt:
+                            Date.now()
+
+                    }
+                );
+
+
+                console.log(
+                    `✅ ${stock} ${timeframe}: ${result.length} candles cached`
+                );
+
+
+                return result;
+
+            }
+
+            finally {
+
+                historicalInFlight.delete(
+                    key
+                );
+            }
+
+        })();
+
+
+    historicalInFlight.set(
+        key,
+        requestPromise
+    );
+
+
+    return requestPromise;
+}
+
+
+/* =========================================================
+   TIMEFRAME AGGREGATION
+========================================================= */
+
+function aggregateCandles(
+    candles,
+    minutes
+) {
+
+    if (!candles.length) {
+        return [];
+    }
+
+
+    const result = [];
+
+    let current = null;
+
+
+    for (
+        const candle of candles
+    ) {
+
+        const time =
+            new Date(
+                candle.time
+            ).getTime();
+
+
+        const bucket =
+            Math.floor(
+                time /
+                (minutes * 60 * 1000)
+            )
+            *
+            (minutes * 60 * 1000);
+
+
+        if (
+            !current ||
+
+            current.bucket !==
+            bucket
+        ) {
+
+            current = {
+
+                bucket,
+
+                time:
+                    new Date(
+                        bucket
+                    ).toISOString(),
+
+                o:
+                    candle.o,
+
+                h:
+                    candle.h,
+
+                l:
+                    candle.l,
+
+                c:
+                    candle.c,
+
+                v:
+                    candle.v
+
+            };
+
+
+            result.push(
+                current
+            );
+
+        }
+
+        else {
+
+            current.h =
+                Math.max(
+                    current.h,
+                    candle.h
+                );
+
+
+            current.l =
+                Math.min(
+                    current.l,
+                    candle.l
+                );
+
+
+            current.c =
+                candle.c;
+
+
+            current.v +=
+                candle.v;
+        }
+    }
+
+
+    return result;
+}
+
+
+/* =========================================================
+   CALENDAR AGGREGATION
+========================================================= */
+
+function aggregateCalendarCandles(
+    candles,
+    type
+) {
+
+    if (!candles.length) {
+        return [];
+    }
+
+
+    const result = [];
+
+    let current = null;
+
+
+    for (
+        const candle of candles
+    ) {
+
+        const date =
+            new Date(
+                candle.time
+            );
+
+
+        let key;
+
+
+        /* =================================================
+           WEEK
+        ================================================= */
+
+        if (
+            type === "week"
+        ) {
+
+            const day =
+                date.getUTCDay();
+
+
+            const diff =
+                day === 0
+                    ? -6
+                    : 1 - day;
+
+
+            const monday =
+                new Date(date);
+
+
+            monday.setUTCDate(
+                monday.getUTCDate() +
+                diff
+            );
+
+
+            key =
+                monday
+                    .toISOString()
+                    .slice(0, 10);
+        }
+
+
+        /* =================================================
+           MONTH
+        ================================================= */
+
+        else {
+
+            key =
+                date
+                    .toISOString()
+                    .slice(0, 7);
+        }
+
+
+        if (
+            !current ||
+
+            current.key !== key
+        ) {
+
+            current = {
+
+                key,
+
+                time:
+                    candle.time,
+
+                o:
+                    candle.o,
+
+                h:
+                    candle.h,
+
+                l:
+                    candle.l,
+
+                c:
+                    candle.c,
+
+                v:
+                    candle.v
+
+            };
+
+
+            result.push(
+                current
+            );
+
+        }
+
+        else {
+
+            current.h =
+                Math.max(
+                    current.h,
+                    candle.h
+                );
+
+
+            current.l =
+                Math.min(
+                    current.l,
+                    candle.l
+                );
+
+
+            current.c =
+                candle.c;
+
+
+            current.v +=
+                candle.v;
+        }
+    }
+
+
+    return result;
+}
+
+
+/* =========================================================
+   ANGEL ONE LOGIN
+========================================================= */
+
+async function loginToAngelOne() {
+
+    try {
+
+        const totp =
+            await generate({
+
+                secret:
+                    process.env.ANGEL_TOTP_SECRET
+
+            });
+
+
+        console.log(
+            "Logging in to Angel One..."
+        );
+
+
+        const session =
+            await smartApi.generateSession(
+
+                process.env.ANGEL_CLIENT_CODE,
+
+                process.env.ANGEL_PIN,
+
+                totp
+
+            );
+
+
+        if (
+            !session.status
+        ) {
+
+            console.error(
+                "Angel One login failed:",
+                session
+            );
+
+            return;
+        }
+
+
+        console.log(
+            "✅ Angel One login successful!"
+        );
+
+
+        const feedToken =
+            session.data.feedToken;
+
+
+        console.log(
+            "✅ Feed token received"
+        );
+
+
+        /* =================================================
+           LOAD INSTRUMENT MASTER
+        ================================================= */
+
+        await loadInstrumentMaster();
+
+
+        /* =================================================
+           ANGEL ONE WEBSOCKET
+        ================================================= */
+
+        const ws =
+            new WebSocketV2({
+
+                jwttoken:
+                    session.data.jwtToken,
+
+                apikey:
+                    process.env.ANGEL_API_KEY,
+
+                clientcode:
+                    process.env.ANGEL_CLIENT_CODE,
+
+                feedtype:
+                    feedToken
+
+            });
+
+
+        await ws.connect();
+
+
+        console.log(
+            "🟢 Angel One WebSocket connected"
+        );
+
+
+        /*
+           Subscribe to all available
+           NIFTY 50 tokens.
+        */
+
+        const tokens =
+            Object.values(
+                symbolTokens
+            )
+                .map(
+                    item =>
+                        item.token
+                );
+
+
+        const request = {
+
+            correlationID:
+                "ema360live",
+
+            action:
+                1,
+
+            mode:
+                1,
+
+            exchangeType:
+                1,
+
+            tokens:
+                tokens
+
+        };
+
+
+        console.log(
+            `📡 Subscribing to ${tokens.length} instruments`
+        );
+
+
+        ws.fetchData(
+            request
+        );
+
+
+        /* =================================================
+           LIVE TICK
+        ================================================= */
+
+        ws.on(
+            "tick",
+            data => {
+
+                if (
+                    !data ||
+
+                    typeof data !==
+                    "object"
+                ) {
+
+                    return;
+                }
+
+
+                const token =
+                    String(
+                        data.token
+                    )
+                        .replace(
+                            /"/g,
+                            ""
+                        );
+
+
+                /*
+                   Angel One LTP is returned
+                   in paise-like format,
+                   so normalize it once
+                   on backend.
+                */
+
+                const rawLtp =
+                    Number(
+                        data.last_traded_price
+                    );
+
+
+                const normalizedTick = {
+
+                    ...data,
+
+                    token,
+
+                    ltp:
+                        Number.isFinite(
+                            rawLtp
+                        )
+                            ? rawLtp / 100
+                            : null
+
+                };
+
+
+                /*
+                   Keep latest tick for
+                   newly connected clients.
+                */
+
+                latestTicks[token] =
+                    normalizedTick;
+
+
+                console.log(
+                    "📈 LIVE TICK:",
+                    token,
+                    data.last_traded_price
+                );
+
+
+                /*
+                   Send the same live tick
+                   to every connected browser.
+
+                   IMPORTANT:
+
+                   Browser clients do NOT
+                   connect separately to
+                   Angel One.
+                */
+
+                const message =
+                    `data: ${JSON.stringify(normalizedTick)}\n\n`;
+
+
+                for (
+                    const client
+                    of clients
+                ) {
+
+                    try {
+
+                        client.write(
+                            message
+                        );
+
+                    }
+
+                    catch (error) {
+
+                        console.error(
+                            "❌ Failed to send tick to browser:",
+                            error
+                        );
+
+                    }
+                }
+
+            }
+        );
+
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "❌ Angel One login error:"
+        );
+
+
+        console.error(
+            error
+        );
+
+    }
+}
+
+
+/* =========================================================
+   ROOT
+========================================================= */
+
+app.get(
+    "/",
+    (req, res) => {
+
+        res.send(
+            "EMA360 backend is running!"
+        );
+
+    }
+);
+
+
+/* =========================================================
+   SYMBOLS
+========================================================= */
+
+app.get(
+    "/api/symbols",
+    (req, res) => {
+
+        res.setHeader(
+            "Access-Control-Allow-Origin",
+            "*"
+        );
+
+
+        res.json(
+            symbolTokens
+        );
+
+    }
+);
+
+
+/* =========================================================
+   HISTORICAL CANDLES API
+========================================================= */
+
+app.get(
+    "/api/historical-candles",
+    async (req, res) => {
+
+        res.setHeader(
+            "Access-Control-Allow-Origin",
+            "*"
+        );
+
+
+        try {
+
+            const stock =
+                req.query.symbol;
+
+
+            const timeframe =
+                req.query.timeframe ||
+                "5M";
+
+
+            if (!stock) {
+
+                return res
+                    .status(400)
+                    .json({
+
+                        error:
+                            "symbol is required"
+
+                    });
+            }
+
+
+            const candles =
+                await getHistoricalCandles(
+
+                    stock,
+
+                    timeframe
+
+                );
+
+
+            res.json(
+                candles
+            );
+
+        }
+
+
+        catch (error) {
+
+            console.error(
+                "❌ Historical candle error:",
+                error
+            );
+
+
+            res
+                .status(500)
+                .json({
+
+                    error:
+                        error.message
+
+                });
+
+        }
+
+    }
+);
+
+
+/* =========================================================
+   CACHE STATUS
+========================================================= */
+
+app.get(
+    "/api/cache-status",
+    (req, res) => {
+
+        res.setHeader(
+            "Access-Control-Allow-Origin",
+            "*"
+        );
+
+
+        const entries = [];
+
+
+        for (
+            const [
+                key,
+                value
+            ]
+            of historicalCache.entries()
+        ) {
+
+            entries.push({
+
+                key,
+
+                candles:
+                    value.data.length,
+
+                ageMs:
+                    Date.now() -
+                    value.cachedAt
+
+            });
+        }
+
+
+        res.json({
+
+            cacheEntries:
+                entries.length,
+
+            inFlight:
+                historicalInFlight.size,
+
+            minCandleRequestIntervalMs:
+                ANGEL_CANDLE_MIN_INTERVAL_MS,
+
+            cacheTtlMs:
+                HISTORICAL_CACHE_TTL_MS,
+
+            entries
+
+        });
+
+    }
+);
+
+
+/* =========================================================
+   LIVE STREAM
+========================================================= */
+
+app.get(
+    "/api/stream",
+    (req, res) => {
+
+        res.setHeader(
+            "Content-Type",
+            "text/event-stream"
+        );
+
+
+        res.setHeader(
+            "Cache-Control",
+            "no-cache"
+        );
+
+
+        res.setHeader(
+            "Connection",
+            "keep-alive"
+        );
+
+
+        res.setHeader(
+            "Access-Control-Allow-Origin",
+            "*"
+        );
+
+
+        res.flushHeaders();
+
+
+        res.write(
+            ": connected\n\n"
+        );
+
+
+        clients.add(
+            res
+        );
+
+
+        console.log(
+            "🌐 Browser connected to live stream"
+        );
+
+
+        /*
+           Immediately send the latest
+           known ticks.
+
+           This means a newly opened
+           browser does not have to wait
+           for the next Angel One tick.
+        */
+
+        for (
+            const tick
+            of Object.values(
+                latestTicks
+            )
+        ) {
+
+            try {
+
+                res.write(
+                    `data: ${JSON.stringify(tick)}\n\n`
+                );
+
+            }
+
+            catch (error) {
+
+                console.error(
+                    "❌ Failed to send initial tick:",
+                    error
+                );
+
+            }
+        }
+
+
+        /* =================================================
+           HEARTBEAT
+        ================================================= */
+
+        const heartbeat =
+            setInterval(
+                () => {
+
+                    try {
+
+                        res.write(
+                            `event: heartbeat\ndata: ${JSON.stringify({
+                                message:
+                                    "EMA360 stream is alive"
+                            })}\n\n`
+                        );
+
+                    }
+
+                    catch (error) {
+
+                        console.error(
+                            "❌ Heartbeat failed:",
+                            error
+                        );
+
+                    }
+
+                },
+
+                15000
+            );
+
+
+        /* =================================================
+           CLIENT DISCONNECT
+        ================================================= */
+
+        req.on(
+            "close",
+            () => {
+
+                clearInterval(
+                    heartbeat
+                );
+
+
+                clients.delete(
+                    res
+                );
+
+
+                console.log(
+                    "🌐 Browser disconnected"
+                );
+
+            }
+        );
+
+    }
+);
+
+// ============================================================
+// NSE SCANNER - NSE ONLY
+// ============================================================
+
+function normalizeNseCandles(response) {
+    if (!response) return [];
+
+    const rawData = Array.isArray(response)
+        ? response
+        : Array.isArray(response.data)
+            ? response.data
+            : [];
+
+    return rawData
+        .map((candle) => ({
+            time: Number(candle.time),
+            open: Number(candle.open),
+            high: Number(candle.high),
+            low: Number(candle.low),
+            close: Number(candle.close),
+            volume: Number(candle.volume),
+        }))
+        .filter(
+            (candle) =>
+                Number.isFinite(candle.time) &&
+                Number.isFinite(candle.open) &&
+                Number.isFinite(candle.high) &&
+                Number.isFinite(candle.low) &&
+                Number.isFinite(candle.close) &&
+                Number.isFinite(candle.volume)
+        )
+        .sort((a, b) => a.time - b.time);
+}
+
+const NSE_COMPANY_CACHE = new Map();
+
+async function getNseCompanyName(symbol) {
+
+    if (NSE_COMPANY_CACHE.has(symbol)) {
+        return NSE_COMPANY_CACHE.get(symbol);
+    }
+
+    try {
+
+        const details =
+            await nseIndia.getEquityDetails(symbol);
+
+        const companyName =
+            details?.info?.companyName ||
+            details?.companyName ||
+            symbol;
+
+        NSE_COMPANY_CACHE.set(
+            symbol,
+            companyName
+        );
+
+        return companyName;
+
+    } catch (error) {
+
+        console.log(
+            `Company name lookup failed for ${symbol}:`,
+            error.message
+        );
+
+        return symbol;
+    }
+}
+
+// ------------------------------------------------------------
+// GET ALL NSE EQUITY STOCK SYMBOLS
+// ------------------------------------------------------------
+async function getNseStocks() {
+    if (NSE_STOCKS_CACHE.length > 0) {
+        return NSE_STOCKS_CACHE;
+    }
+
+    console.log("Fetching complete NSE stock list...");
+
+    const symbols = await nseIndia.getAllStockSymbols();
+
+    NSE_STOCKS_CACHE = [...new Set(
+        symbols
+            .map((symbol) => String(symbol).trim().toUpperCase())
+            .filter(Boolean)
+    )];
+
+    console.log(
+        `NSE stock universe loaded: ${NSE_STOCKS_CACHE.length} stocks`
+    );
+
+    return NSE_STOCKS_CACHE;
+}
+
+// ============================================================
+// BUILD NSE PRIORITY LIST
+// ============================================================
+//
+// Purpose:
+//
+// 1. Get the complete NSE stock universe.
+// 2. Get the latest NSE daily price/change for each stock.
+// 3. Sort stocks by % change, highest first.
+// 4. Cache the result so every scan does NOT rebuild it.
+//
+// The scanner frontend will use this list to scan high-change
+// stocks first.
+//
+// IMPORTANT:
+// This is ONLY for scan ordering.
+// It does NOT decide whether a stock passes the condition.
+// The normal candle condition check still happens later.
+// ============================================================
+
+async function getNsePriorityStocks() {
+
+    const now = Date.now();
+
+    // --------------------------------------------------------
+    // RETURN CACHE IF IT IS STILL FRESH
+    // --------------------------------------------------------
+
+    if (
+        NSE_PRIORITY_CACHE.length > 0 &&
+        (now - NSE_PRIORITY_CACHE_TIME) <
+        NSE_PRIORITY_CACHE_TTL_MS
+    ) {
+
+        console.log(
+            `⚡ Using cached NSE priority list: ${NSE_PRIORITY_CACHE.length} stocks`
+        );
+
+        return NSE_PRIORITY_CACHE;
+    }
+
+
+    // --------------------------------------------------------
+    // IF ANOTHER REQUEST IS ALREADY BUILDING THE LIST,
+    // WAIT FOR THAT SAME REQUEST.
+    // --------------------------------------------------------
+
+    if (NSE_PRIORITY_INFLIGHT) {
+
+        console.log(
+            "⏳ NSE priority list is already being built. Waiting..."
+        );
+
+        return NSE_PRIORITY_INFLIGHT;
+    }
+
+
+    // --------------------------------------------------------
+    // BUILD ONLY ONCE
+    // --------------------------------------------------------
+
+    NSE_PRIORITY_INFLIGHT =
+        (async () => {
+
+            try {
+
+                console.log(
+                    "🚀 Building NSE priority list..."
+                );
+
+
+                const symbols =
+                    await getNseStocks();
+
+
+                console.log(
+                    `📊 NSE priority calculation started for ${symbols.length} stocks`
+                );
+
+
+                const results = [];
+
+                let cursor = 0;
+
+                // ------------------------------------------------
+                // LIMITED CONCURRENCY
+                // ------------------------------------------------
+                //
+                // We do NOT fire 2000 requests at once.
+                // A small number of workers keeps NSE requests
+                // controlled while still being much faster than
+                // checking every stock one-by-one.
+                // ------------------------------------------------
+
+                const WORKERS = 6;
+
+
+                async function worker() {
+
+                    while (true) {
+
+                        const index =
+                            cursor++;
+
+
+                        if (
+                            index >=
+                            symbols.length
+                        ) {
+
+                            return;
+                        }
+
+
+                        const symbol =
+                            symbols[index];
+
+
+                        try {
+
+                            const today =
+                                new Date();
+
+
+                            // We only need a few recent trading
+                            // days because we need the latest
+                            // close and previous close.
+
+                            const start =
+                                new Date(
+                                    today.getTime() -
+                                    10 *
+                                    24 *
+                                    60 *
+                                    60 *
+                                    1000
+                                );
+
+
+                            const dailyResponse =
+                                await nseIndia.getEquityHistoricalData(
+                                    symbol,
+                                    {
+                                        start,
+                                        end: today
+                                    }
+                                );
+
+
+                            // ------------------------------------------------
+                            // NSE RESPONSE CAN BE:
+                            //
+                            // [
+                            //   {
+                            //      data: [...]
+                            //   }
+                            // ]
+                            //
+                            // ------------------------------------------------
+
+                            let dailyRaw = [];
+
+
+                            if (
+                                Array.isArray(
+                                    dailyResponse
+                                )
+                            ) {
+
+                                dailyRaw =
+                                    dailyResponse.flatMap(
+                                        item =>
+                                            Array.isArray(
+                                                item?.data
+                                            )
+                                                ? item.data
+                                                : []
+                                    );
+
+                            }
+
+                            else if (
+                                Array.isArray(
+                                    dailyResponse?.data
+                                )
+                            ) {
+
+                                dailyRaw =
+                                    dailyResponse.data;
+
+                            }
+
+
+                            if (
+                                dailyRaw.length === 0
+                            ) {
+
+                                return;
+                            }
+
+
+                            // ------------------------------------------------
+                            // PARSE DAILY DATA
+                            // ------------------------------------------------
+
+                            const daily =
+                                dailyRaw
+                                    .map(row => {
+
+                                        const date =
+                                            row.mTIMESTAMP ||
+                                            row.mtimestamp ||
+                                            row.CH_TIMESTAMP ||
+                                            row.chTimestamp ||
+                                            row.date ||
+                                            row.timestamp;
+
+
+                                        const close =
+                                            Number(
+                                                row.CH_CLOSING_PRICE ??
+                                                row.chClosingPrice ??
+                                                row.close ??
+                                                row.CLOSE ??
+                                                0
+                                            );
+
+
+                                        const previousClose =
+                                            Number(
+                                                row.CH_PREVIOUS_CLS_PRICE ??
+                                                row.chPreviousClsPrice ??
+                                                row.previousClose ??
+                                                row.PREVIOUS_CLOSE ??
+                                                0
+                                            );
+
+
+                                        return {
+                                            date,
+                                            close,
+                                            previousClose
+                                        };
+
+                                    })
+
+                                    .filter(row =>
+
+                                        row.date &&
+
+                                        Number.isFinite(
+                                            row.close
+                                        ) &&
+
+                                        row.close > 0
+
+                                    )
+
+                                    .sort(
+                                        (a, b) =>
+                                            new Date(
+                                                a.date
+                                            ).getTime()
+                                            -
+                                            new Date(
+                                                b.date
+                                            ).getTime()
+                                    );
+
+
+                            if (
+                                daily.length === 0
+                            ) {
+
+                                return;
+                            }
+
+
+                            // ------------------------------------------------
+                            // LATEST TRADING DAY
+                            // ------------------------------------------------
+
+                            const latest =
+                                daily[
+                                    daily.length - 1
+                                ];
+
+
+                            let previousClose =
+                                Number(
+                                    latest.previousClose
+                                );
+
+
+                            // If NSE did not provide previous
+                            // close inside the latest row,
+                            // use the previous daily candle.
+
+                            if (
+                                !Number.isFinite(
+                                    previousClose
+                                ) ||
+                                previousClose <= 0
+                            ) {
+
+                                if (
+                                    daily.length >= 2
+                                ) {
+
+                                    previousClose =
+                                        Number(
+                                            daily[
+                                                daily.length - 2
+                                            ].close
+                                        );
+
+                                }
+
+                            }
+
+
+                            const price =
+                                Number(
+                                    latest.close
+                                );
+
+
+                            if (
+                                !Number.isFinite(
+                                    price
+                                ) ||
+                                price <= 0 ||
+                                !Number.isFinite(
+                                    previousClose
+                                ) ||
+                                previousClose <= 0
+                            ) {
+
+                                return;
+                            }
+
+
+                            // ------------------------------------------------
+                            // CALCULATE % CHANGE
+                            // ------------------------------------------------
+
+                            const change =
+                                (
+                                    (
+                                        price -
+                                        previousClose
+                                    ) /
+                                    previousClose
+                                ) *
+                                100;
+
+
+                            if (
+                                !Number.isFinite(
+                                    change
+                                )
+                            ) {
+
+                                return;
+                            }
+
+
+                            results.push({
+
+                                symbol,
+
+                                price,
+
+                                previousClose,
+
+                                change
+
+                            });
+
+
+                        }
+
+                        catch (error) {
+
+                            console.log(
+                                `Priority change failed for ${symbol}:`,
+                                error.message
+                            );
+
+                        }
+
+                    }
+
+                }
+
+
+                // ------------------------------------------------
+                // START LIMITED WORKERS
+                // ------------------------------------------------
+
+                const workers =
+                    Array.from(
+                        {
+                            length:
+                                Math.min(
+                                    WORKERS,
+                                    symbols.length
+                                )
+                        },
+                        () => worker()
+                    );
+
+
+                await Promise.all(
+                    workers
+                );
+
+
+                // ------------------------------------------------
+                // SORT HIGHEST % CHANGE FIRST
+                // ------------------------------------------------
+
+                results.sort(
+                    (a, b) =>
+                        Number(b.change) -
+                        Number(a.change)
+                );
+
+
+                // ------------------------------------------------
+                // SAVE CACHE
+                // ------------------------------------------------
+
+                NSE_PRIORITY_CACHE =
+                    results;
+
+                NSE_PRIORITY_CACHE_TIME =
+                    Date.now();
+
+
+                console.log(
+                    `✅ NSE priority list ready: ${results.length} stocks`
+                );
+
+
+                if (
+                    results.length > 0
+                ) {
+
+                    console.log(
+                        "🔥 TOP NSE PRIORITY STOCKS:",
+                        results
+                            .slice(0, 20)
+                            .map(
+                                item =>
+                                    `${item.symbol} ${item.change.toFixed(2)}%`
+                            )
+                    );
+
+                }
+
+
+                return results;
+
+            }
+
+            finally {
+
+                NSE_PRIORITY_INFLIGHT =
+                    null;
+
+            }
+
+        })();
+
+
+    return NSE_PRIORITY_INFLIGHT;
+}
+
+
+// ============================================================
+// MAGIC FILTER PARSER
+// ============================================================
+// Converts natural English / Hinglish / common broken-English
+// scanner requests into the SAME condition objects used by the
+// React scanner. This deliberately uses no paid AI service and
+// therefore requires no API key.
+// ============================================================
+
+function normalizeMagicPrompt(value) {
+    return String(value || "")
+        .toLowerCase()
+        .replace(/[×✕]/g, "x")
+        .replace(/₹/g, " rs ")
+        .replace(/%/g, " percent ")
+        .replace(/[“”‘’]/g, "'")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function magicNumber(value, fallback = null) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function magicTimeframeFromText(text) {
+    const normalized = text
+        .replace(/minutes?/g, "m")
+        .replace(/mins?/g, "m")
+        .replace(/hours?/g, "h")
+        .replace(/hrs?/g, "h")
+        .replace(/daily|day|1 day/g, "1d");
+
+    const match = normalized.match(/\b(1|3|5|15|30|60)\s*(m|h)\b/);
+    if (!match) {
+        if (/\b5\s*minute|\b5m\b/.test(text)) return "5m";
+        if (/\b15\s*minute|\b15m\b/.test(text)) return "15m";
+        if (/\b30\s*minute|\b30m\b/.test(text)) return "30m";
+        if (/\b1\s*hour|\b1h\b/.test(text)) return "1h";
+        if (/\bdaily\b|\b1d\b|\bday\b/.test(text)) return "1d";
+        if (/\b3\s*minute|\b3m\b/.test(text)) return "3m";
+        if (/\b1\s*minute|\b1m\b/.test(text)) return "1m";
+        return null;
+    }
+
+    if (match[2] === "h") {
+        return match[1] === "1" ? "1h" : null;
+    }
+
+    return `${match[1]}m`;
+}
+
+function magicConditionKey(condition) {
+    return JSON.stringify({
+        type: condition.type,
+        value: condition.value ?? null,
+        period: condition.period ?? null,
+        multiplier: condition.multiplier ?? null
+    });
+}
+
+function parseMagicFilterPrompt(prompt) {
+    const text = normalizeMagicPrompt(prompt);
+    const conditions = [];
+    const explanations = [];
+
+    const add = (condition, explanation) => {
+        if (!condition || !condition.type) return;
+        const key = magicConditionKey(condition);
+        if (!conditions.some(item => magicConditionKey(item) === key)) {
+            conditions.push(condition);
+            explanations.push(explanation);
+        }
+    };
+
+    const timeframe = magicTimeframeFromText(text);
+
+    // ------------------------------------------------------------
+    // Five consecutive green candles
+    // ------------------------------------------------------------
+    if (
+        /(?:5|five)\s*(?:consecutive\s*)?(?:green|bullish)\s*candles?/.test(text) ||
+        /(?:5|five)\s*(?:green|bullish)\s*(?:candle|candles)/.test(text) ||
+        /5\s*green\s*(?:hai|ho|hona|hove)/.test(text)
+    ) {
+        add(
+            { type: "five_green" },
+            "5 consecutive green candles"
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Volume > multiplier × SMA(volume, period)
+    // Examples:
+    // 5 min volume 2x sma 10
+    // volume double average
+    // 5 min ka volume sma 10 se 2 guna zyada
+    // ------------------------------------------------------------
+    const volumeMultiplierPatterns = [
+        /volume.{0,80}?(\d+(?:\.\d+)?)\s*x.{0,40}?(?:sma|average|avg)/,
+        /(?:sma|average|avg).{0,30}?volume.{0,50}?(\d+(?:\.\d+)?)\s*x/,
+        /volume.{0,80}?(?:double|twice|2\s*times|2\s*guna|2\s*gun|do\s*guna).{0,40}?(?:average|avg|sma)/,
+        /(?:average|avg|sma).{0,40}?(?:se|than|ke).{0,20}?(?:volume|volume\s*ka).{0,50}?(?:double|2\s*times|2\s*guna)/
+    ];
+
+    let volumeMultiplier = null;
+    for (const pattern of volumeMultiplierPatterns) {
+        const match = text.match(pattern);
+        if (match) {
+            volumeMultiplier = magicNumber(match[1], 2);
+            if (!match[1]) volumeMultiplier = 2;
+            break;
+        }
+    }
+
+    if (volumeMultiplier !== null) {
+        let period = 10;
+        const periodMatch = text.match(/(?:sma|average|avg)[^0-9]{0,20}(\d{1,3})/);
+        if (periodMatch) period = magicNumber(periodMatch[1], 10);
+
+        add(
+            {
+                type: "volume_multiple_sma",
+                multiplier: volumeMultiplier,
+                period
+            },
+            `Volume > ${volumeMultiplier} × SMA(Volume,${period})`
+        );
+    } else if (
+        /rising\s+volume|increasing\s+volume|volume\s+(?:is\s+)?(?:rising|increasing|high|strong)|volume\s*(?:badh|badha|zyada|jyada|high)|volume\s+(?:upar|up)/.test(text)
+    ) {
+        const periodMatch = text.match(/(?:sma|average|avg)[^0-9]{0,20}(\d{1,3})/);
+        const period = magicNumber(periodMatch?.[1], 10);
+        add(
+            { type: "volume_above_sma", period },
+            `Volume > SMA(Volume,${period})`
+        );
+    }
+
+    // ------------------------------------------------------------
+    // Close / price above or below EMA N
+    // ------------------------------------------------------------
+    const emaAbove =
+        text.match(/(?:close|price|stock).{0,60}(?:above|over|greater\s+than|higher\s+than|upar|ke\s+upar|se\s+upar).{0,20}?(?:ema|exponential\s+moving\s+average)\s*(\d{1,3})/) ||
+        text.match(/(?:ema|exponential\s+moving\s+average)\s*(\d{1,3}).{0,40}(?:above|upar|ke\s+upar)/) ||
+        text.match(/(?:\b\d{1,3}\s*)?(?:ema|exponential\s+moving\s+average)\s*(\d{1,3})?\s*(?:ke\s+)?(?:upar|above)/) ||
+        text.match(/\b(\d{1,3})\s*(?:ema|exponential\s+moving\s+average)\s*(?:ke\s+)?(?:upar|above)/);
+
+    if (emaAbove) {
+        const period = magicNumber(emaAbove[1], 20);
+        add(
+            { type: "close_above_ema", period },
+            `Close > EMA ${period}`
+        );
+    }
+
+    const emaBelow =
+        text.match(/(?:close|price|stock).{0,60}(?:below|under|less\s+than|lower\s+than|neeche|niche|ke\s+neeche|se\s+neeche).{0,20}?(?:ema|exponential\s+moving\s+average)\s*(\d{1,3})/) ||
+        text.match(/(?:ema|exponential\s+moving\s+average)\s*(\d{1,3}).{0,40}(?:below|neeche|niche|ke\s+neeche)/) ||
+        text.match(/\b(\d{1,3})\s*(?:ema|exponential\s+moving\s+average)\s*(?:ke\s+)?(?:neeche|niche|below)/);
+
+    if (emaBelow) {
+        const period = magicNumber(emaBelow[1], 20);
+        add(
+            { type: "close_below_ema", period },
+            `Close < EMA ${period}`
+        );
+    }
+
+    // Exact existing shorthand: close above EMA 20 / close below EMA 20.
+    if (/(?:close|price).{0,15}(?:>|above).{0,15}ema\s*20/.test(text)) {
+        add({ type: "close_above_ema", period: 20 }, "Close > EMA 20");
+    }
+    if (/(?:close|price).{0,15}(?:<|below).{0,15}ema\s*20/.test(text)) {
+        add({ type: "close_below_ema", period: 20 }, "Close < EMA 20");
+    }
+
+    // ------------------------------------------------------------
+    // Price above / below a numeric value
+    // ------------------------------------------------------------
+    const priceAbove =
+        text.match(/(?:price|stock|share|close).{0,30}(?:above|over|greater\s+than|higher\s+than|upar|ke\s+upar|se\s+upar|>)\s*(?:rs\s*)?(\d+(?:\.\d+)?)/) ||
+        text.match(/(?:above|over|upar|ke\s+upar)\s*(?:rs\s*)?(\d+(?:\.\d+)?)/) ||
+        text.match(/(?:price|stock|share|close)\s*(?:is\s*)?(?:rs\s*)?(\d+(?:\.\d+)?)\s*(?:(?:ke|se)\s+)?(?:upar|above|over)/);
+
+    if (priceAbove) {
+        const value = magicNumber(priceAbove[1]);
+        if (value !== null) add({ type: "price_above", value }, `Price > ${value}`);
+    }
+
+    const priceBelow =
+        text.match(/(?:price|stock|share|close).{0,30}(?:below|under|less\s+than|lower\s+than|neeche|niche|ke\s+neeche|se\s+neeche|<)\s*(?:rs\s*)?(\d+(?:\.\d+)?)/) ||
+        text.match(/(?:below|under|neeche|niche|ke\s+neeche)\s*(?:rs\s*)?(\d+(?:\.\d+)?)/) ||
+        text.match(/(?:price|stock|share|close)\s*(?:is\s*)?(?:rs\s*)?(\d+(?:\.\d+)?)\s*(?:(?:ke|se)\s+)?(?:neeche|niche|below|under)/);
+
+    if (priceBelow) {
+        const value = magicNumber(priceBelow[1]);
+        if (value !== null) add({ type: "price_below", value }, `Price < ${value}`);
+    }
+
+    // ------------------------------------------------------------
+    // % change / momentum
+    // ------------------------------------------------------------
+    const changeAbove =
+        text.match(/(?:up|gain|gained|increase|increased|rising|badh|badha|upar).{0,35}?(?:by|of|se|more\s+than|above)?\s*(\d+(?:\.\d+)?)\s*(?:percent|per\s*cent|pct)/) ||
+        text.match(/(?:change|percent\s*change).{0,30}(?:above|over|greater\s+than|>)\s*(\d+(?:\.\d+)?)\s*(?:percent|pct)?/);
+
+    if (changeAbove) {
+        const value = magicNumber(changeAbove[1]);
+        if (value !== null) add({ type: "change_above", value }, `% Change > ${value}%`);
+    }
+
+    const changeBelow =
+        text.match(/(?:down|fall|fell|decrease|decreased|falling|gir|gira|neeche).{0,35}?(?:by|of|se|more\s+than|below)?\s*(\d+(?:\.\d+)?)\s*(?:percent|per\s*cent|pct)/) ||
+        text.match(/(?:change|percent\s*change).{0,30}(?:below|under|less\s+than|<)\s*(\d+(?:\.\d+)?)\s*(?:percent|pct)?/);
+
+    if (changeBelow) {
+        const value = magicNumber(changeBelow[1]);
+        if (value !== null) add({ type: "change_below", value }, `% Change < ${value}%`);
+    }
+
+    // "stocks going upwards" / "upar ja rahe stocks" = positive daily change.
+    if (
+        !conditions.some(c => c.type === "change_above") &&
+        /stocks?.{0,20}(?:going|moving|trading|ja|chal).{0,30}(?:up|upwards|upar|badh|positive)/.test(text) ||
+        /(?:stocks?|shares?).{0,20}(?:upar|badh|badhe|chadh).{0,20}(?:rahe|rhe|hai|hain)/.test(text)
+    ) {
+        add({ type: "change_above", value: 0 }, "% Change > 0%");
+    }
+
+    if (
+        !conditions.some(c => c.type === "change_below") &&
+        /stocks?.{0,20}(?:going|moving|trading).{0,30}(?:down|downwards|neeche|falling|negative)/.test(text)
+    ) {
+        add({ type: "change_below", value: 0 }, "% Change < 0%");
+    }
+
+    // ------------------------------------------------------------
+    // If the user says only "volume 2x" without explicitly saying
+    // SMA/average, treat it as the common 10-period volume average.
+    // ------------------------------------------------------------
+    if (
+        volumeMultiplier === null &&
+        !conditions.some(c => c.type === "volume_above_sma") &&
+        /volume.{0,20}(?:2x|2\s*times|double|twice|2\s*guna|2\s*gun)/.test(text)
+    ) {
+        add(
+            { type: "volume_multiple_sma", multiplier: 2, period: 10 },
+            "Volume > 2 × SMA(Volume,10)"
+        );
+    }
+
+    return {
+        success: conditions.length > 0,
+        timeframe: timeframe || null,
+        conditions,
+        explanations,
+        normalizedPrompt: text,
+        message: conditions.length > 0
+            ? "Magic Filter understood the request."
+            : "I could not map that sentence to a supported scanner condition yet. Try mentioning volume, SMA, EMA, price, % change, green candles, above/upar, or below/neeche."
+    };
+}
+
+// ============================================================
+// SERVER-SIDE CONDITION HELPERS
+// Used by the NSE backtest. The live React scanner has its own
+// equivalent checks so normal scanning behavior stays unchanged.
+// ============================================================
+
+function serverSma(values, period) {
+    if (!Array.isArray(values) || values.length < period) return null;
+    const recent = values.slice(-period).map(Number);
+    if (recent.some(value => !Number.isFinite(value))) return null;
+    return recent.reduce((sum, value) => sum + value, 0) / period;
+}
+
+function serverEma(values, period) {
+    if (!Array.isArray(values) || values.length < period) return null;
+    const multiplier = 2 / (period + 1);
+    let result = values.slice(0, period).reduce((sum, value) => sum + Number(value), 0) / period;
+    for (let i = period; i < values.length; i++) {
+        const value = Number(values[i]);
+        if (!Number.isFinite(value)) return null;
+        result = ((value - result) * multiplier) + result;
+    }
+    return result;
+}
+
+function serverDateKey(value) {
+    const date = new Date(value);
+    if (!Number.isFinite(date.getTime())) return null;
+    return new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).format(date);
+}
+
+function buildDailyChangeMap(candles) {
+    const byDay = new Map();
+
+    for (const candle of candles) {
+        const day = serverDateKey(candle.time);
+        if (!day) continue;
+        byDay.set(day, Number(candle.close));
+    }
+
+    const days = [...byDay.keys()].sort();
+    const map = new Map();
+
+    for (let i = 1; i < days.length; i++) {
+        const previousClose = Number(byDay.get(days[i - 1]));
+        const currentClose = Number(byDay.get(days[i]));
+        if (previousClose > 0 && Number.isFinite(currentClose)) {
+            map.set(
+                days[i],
+                ((currentClose - previousClose) / previousClose) * 100
+            );
+        }
+    }
+
+    return map;
+}
+
+function checkServerCondition(condition, candles, dailyChangeMap, currentIndex) {
+    const history = candles.slice(0, currentIndex + 1);
+    const closes = history.map(c => Number(c.close));
+    const volumes = history.map(c => Number(c.volume));
+    const latestClose = closes[closes.length - 1];
+    const latestVolume = volumes[volumes.length - 1];
+
+    if (!condition || !history.length) return false;
+
+    if (condition.type === "close_above_ema20" || condition.type === "close_above_ema") {
+        const period = Number(condition.period || 20);
+        const value = serverEma(closes, period);
+        return value !== null && latestClose > value;
+    }
+
+    if (condition.type === "close_below_ema20" || condition.type === "close_below_ema") {
+        const period = Number(condition.period || 20);
+        const value = serverEma(closes, period);
+        return value !== null && latestClose < value;
+    }
+
+    if (condition.type === "volume_2x_sma10") {
+        const value = serverSma(volumes, 10);
+        return value !== null && latestVolume > (2 * value);
+    }
+
+    if (condition.type === "volume_multiple_sma") {
+        const period = Number(condition.period || 10);
+        const multiplier = Number(condition.multiplier || 2);
+        const value = serverSma(volumes, period);
+        return value !== null && latestVolume > (multiplier * value);
+    }
+
+    if (condition.type === "volume_above_sma") {
+        const period = Number(condition.period || 10);
+        const value = serverSma(volumes, period);
+        return value !== null && latestVolume > value;
+    }
+
+    if (condition.type === "five_green") {
+        if (history.length < 5) return false;
+        return history.slice(-5).every(c => Number(c.close) > Number(c.open));
+    }
+
+    if (condition.type === "price_above") {
+        return latestClose > Number(condition.value);
+    }
+
+    if (condition.type === "price_below") {
+        return latestClose < Number(condition.value);
+    }
+
+    if (condition.type === "change_above" || condition.type === "change_below") {
+        const day = serverDateKey(history[history.length - 1].time);
+        const change = Number(dailyChangeMap?.get(day));
+        if (!Number.isFinite(change)) return false;
+        const value = Number(condition.value || 0);
+        return condition.type === "change_above" ? change > value : change < value;
+    }
+
+    return false;
+}
+
+// ------------------------------------------------------------
+// GET NSE TOKEN FOR SYMBOL
+// ------------------------------------------------------------
+async function getNseToken(symbol) {
+    if (NSE_TOKEN_CACHE.has(symbol)) {
+        return NSE_TOKEN_CACHE.get(symbol);
+    }
+
+    try {
+        const info = await nseIndia.getEquitySymbolInfo(symbol);
+
+        if (!info || !info.scripcode) {
+            console.log(`No NSE token found for ${symbol}`);
+            return null;
+        }
+
+        const token = String(info.scripcode);
+
+        NSE_TOKEN_CACHE.set(symbol, token);
+
+        return token;
+    } catch (error) {
+        console.log(
+            `Token lookup failed for ${symbol}:`,
+            error.message
+        );
+
+        return null;
+    }
+}
+
+
+function keepOnlyCompletedCandles(candles, timeframe) {
+
+    if (!Array.isArray(candles) || candles.length === 0) {
+        return [];
+    }
+
+    const minutes = {
+        "1m": 1,
+        "3m": 3,
+        "5m": 5,
+        "15m": 15,
+        "30m": 30,
+        "1h": 60
+    }[timeframe];
+
+    if (!minutes) {
+        return candles;
+    }
+
+    const intervalMs =
+        minutes * 60 * 1000;
+
+    const nowMs = Date.now();
+
+    const completed = candles.filter(candle => {
+
+        const timeMs =
+            new Date(candle.time).getTime();
+
+        if (!Number.isFinite(timeMs)) {
+            return false;
+        }
+
+        return (
+            timeMs + intervalMs <= nowMs
+        );
+    });
+
+    // ---------------------------------------------------------
+    // Remove only the NSE 15:30 closing/post-market candle
+    // if it is the LAST candle in the completed series.
+    //
+    // Do NOT remove all historical candles after 15:30.
+    // ---------------------------------------------------------
+
+    if (completed.length > 0) {
+
+        const last =
+            completed[completed.length - 1];
+
+        const lastDate =
+            new Date(last.time);
+
+        const istParts =
+            new Intl.DateTimeFormat(
+                "en-GB",
+                {
+                    timeZone: "Asia/Kolkata",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    hour12: false
+                }
+            ).formatToParts(lastDate);
+
+        const hour =
+            Number(
+                istParts.find(
+                    p => p.type === "hour"
+                )?.value
+            );
+
+        const minute =
+            Number(
+                istParts.find(
+                    p => p.type === "minute"
+                )?.value
+            );
+
+        if (
+            hour === 15 &&
+            minute >= 30
+        ) {
+            completed.pop();
+        }
+    }
+
+    return completed;
+}
+
+
+// ------------------------------------------------------------
+// FETCH NSE CANDLES FOR SELECTED TIMEFRAME
+// ------------------------------------------------------------
+async function getNseCandles(symbol, timeframe = "5m", includeIncomplete = false) {
+    try {
+        const token = await getNseToken(symbol);
+
+        console.log(
+            "DIAGNOSTIC TOKEN:",
+            symbol,
+            "=>",
+            token
+        );
+
+        if (!token) {
+            console.log(
+                "❌ NO NSE TOKEN FOR:",
+                symbol
+            );
+
+            return [];
+        }
+
+        /*
+         * Large warm-up windows are intentional. Chartink calculates
+         * indicators from a historical intraday series; using only the
+         * latest 10 days can make EMA20 differ at the latest candle.
+         */
+        const timeframeConfig = {
+            "1m": {
+                interval: 1,
+                days: 15
+            },
+
+            "3m": {
+                interval: 3,
+                days: 30
+            },
+
+            "5m": {
+                interval: 5,
+                days: 60
+            },
+
+            "15m": {
+                interval: 15,
+                days: 120
+            },
+
+            "30m": {
+                interval: 30,
+                days: 180
+            },
+
+            "1h": {
+                interval: 60,
+                days: 365
+            },
+
+            "1d": {
+                interval: "D",
+                days: 1000
+            }
+        };
+
+        const config = timeframeConfig[timeframe];
+
+        if (!config) {
+            throw new Error(
+                `Unsupported NSE timeframe: ${timeframe}`
+            );
+        }
+
+        const now = new Date();
+
+        const start = new Date(
+            now.getTime() -
+            config.days * 24 * 60 * 60 * 1000
+        );
+
+        const response =
+            await nseIndia.getEquityChartHistoricalData(
+                symbol,
+                {
+                    start,
+                    end: now,
+                },
+                token,
+                "Equity",
+                "I",
+                config.interval
+            );
+
+        console.log(
+            "NSE RAW RESPONSE:",
+            symbol,
+            "type =",
+            Array.isArray(response)
+                ? "ARRAY"
+                : typeof response,
+            "length =",
+            Array.isArray(response)
+                ? response.length
+                : Array.isArray(response?.data)
+                    ? response.data.length
+                    : "NO DATA ARRAY"
+        );
+
+        const candles = normalizeNseCandles(response);
+
+        console.log(
+            "NSE NORMALIZED:",
+            symbol,
+            "candles =",
+            candles.length
+        );
+
+        if (candles.length > 0) {
+            console.log(
+                "NSE FIRST CANDLE:",
+                candles[0]
+            );
+
+            console.log(
+                "NSE LAST CANDLE:",
+                candles[candles.length - 1]
+            );
+        }
+
+        // Normal scanner behavior:
+        // only completed candles are returned.
+        //
+        // Diagnostic mode:
+        // return the raw NSE series, including the latest
+        // possibly-incomplete candle.
+        return includeIncomplete
+            ? candles
+            : keepOnlyCompletedCandles(candles, timeframe);
+
+    } catch (error) {
+
+        console.log(
+            `NSE ${timeframe} candle fetch failed for ${symbol}:`,
+            error.message
+        );
+
+        return [];
+    }
+}
+
+function getIstDateKey(value) {
+    const date = new Date(value);
+
+    if (!Number.isFinite(date.getTime())) {
+        return null;
+    }
+
+    return new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).format(date);
+}
+
+// ------------------------------------------------------------
+// NSE RESULT DISPLAY STATS
+// ------------------------------------------------------------
+//
+// Scanner condition:
+//     NSE 5-minute candles
+//
+// Result table:
+//     NSE DAILY historical data
+//
+// price        = latest NSE daily closing price
+// previousClose= NSE previous closing price
+// change       = calculated from those two values
+// dailyVolume  = NSE daily traded quantity
+//
+// IMPORTANT:
+// getEquityHistoricalData() returns:
+//
+// [
+//   {
+//      data: [ ...daily rows... ],
+//      meta: {...}
+//   }
+// ]
+//
+// Therefore we MUST extract response[0].data.
+// ------------------------------------------------------------
+
+async function getNseResultStatsFromCandles(symbol, candles) {
+
+    if (
+        !Array.isArray(candles) ||
+        candles.length === 0
+    ) {
+        return null;
+    }
+
+
+    // ========================================================
+    // FETCH DAILY NSE DATA
+    // ========================================================
+
+    try {
+
+        const today =
+            new Date();
+
+
+        const start =
+            new Date(
+                today.getTime() -
+                10 * 24 * 60 * 60 * 1000
+            );
+
+
+        const dailyResponse =
+            await nseIndia.getEquityHistoricalData(
+                symbol,
+                {
+                    start,
+                    end: today
+                }
+            );
+
+
+        console.log(
+            `NSE DAILY RAW ${symbol}:`,
+            JSON.stringify(
+                dailyResponse,
+                null,
+                2
+            )
+        );
+
+
+        // ====================================================
+        // IMPORTANT:
+        //
+        // Response structure is:
+        //
+        // [
+        //   {
+        //      data: [...]
+        //      meta: {...}
+        //   }
+        // ]
+        // ====================================================
+
+        let dailyRaw = [];
+
+
+        if (
+            Array.isArray(dailyResponse)
+        ) {
+
+            dailyRaw =
+                dailyResponse.flatMap(
+                    item =>
+                        Array.isArray(item?.data)
+                            ? item.data
+                            : []
+                );
+
+        }
+
+        else if (
+            Array.isArray(
+                dailyResponse?.data
+            )
+        ) {
+
+            dailyRaw =
+                dailyResponse.data;
+
+        }
+
+
+        console.log(
+            `NSE DAILY ROWS ${symbol}:`,
+            dailyRaw.length
+        );
+
+
+        if (
+            dailyRaw.length > 0
+        ) {
+
+            console.log(
+                `NSE DAILY FIRST ROW ${symbol}:`,
+                dailyRaw[0]
+            );
+
+            console.log(
+                `NSE DAILY LAST ROW ${symbol}:`,
+                dailyRaw[
+                    dailyRaw.length - 1
+                ]
+            );
+
+        }
+
+
+        // ====================================================
+        // PARSE DAILY ROWS
+        // ====================================================
+
+        const daily =
+            dailyRaw
+                .map(row => {
+
+                    return {
+
+                        date:
+                            row.mTIMESTAMP ||
+                            row.mtimestamp ||
+                            row.CH_TIMESTAMP ||
+                            row.chTimestamp ||
+                            row.date ||
+                            row.timestamp,
+
+
+                        close:
+                            Number(
+                                row.CH_CLOSING_PRICE ??
+                                row.chClosingPrice ??
+                                row.close ??
+                                row.CLOSE ??
+                                0
+                            ),
+
+
+                        previousClose:
+                            Number(
+                                row.CH_PREVIOUS_CLS_PRICE ??
+                                row.chPreviousClsPrice ??
+                                row.previousClose ??
+                                row.PREVIOUS_CLOSE ??
+                                0
+                            ),
+
+
+                        volume:
+                            Number(
+                                row.CH_TOT_TRADED_QTY ??
+                                row.chTotTradedQty ??
+                                row.totalTradedQuantity ??
+                                row.volume ??
+                                row.TOT_TRADED_QTY ??
+                                0
+                            )
+
+                    };
+
+                })
+
+                .filter(row =>
+
+                    Number.isFinite(
+                        row.close
+                    )
+
+                    &&
+
+                    row.close > 0
+
+                    &&
+
+                    Number.isFinite(
+                        row.volume
+                    )
+
+                )
+
+                .sort(
+                    (a, b) =>
+                        new Date(
+                            a.date
+                        ).getTime()
+                        -
+                        new Date(
+                            b.date
+                        ).getTime()
+                );
+
+
+        console.log(
+            `NSE DAILY PARSED ${symbol}:`,
+            daily
+        );
+
+
+        // ====================================================
+        // GET LATEST NSE TRADING DAY
+        // ====================================================
+
+        if (
+            daily.length > 0
+        ) {
+
+            const latestDaily =
+                daily[
+                    daily.length - 1
+                ];
+
+
+            // ------------------------------------------------
+            // NSE historical row already contains
+            // PREVIOUS CLOSE.
+            // ------------------------------------------------
+
+            let previousClose =
+                Number(
+                    latestDaily.previousClose
+                );
+
+
+            // ------------------------------------------------
+            // Safety fallback:
+            // previous daily candle
+            // ------------------------------------------------
+
+            if (
+                !Number.isFinite(
+                    previousClose
+                )
+                ||
+                previousClose <= 0
+            ) {
+
+                if (
+                    daily.length >= 2
+                ) {
+
+                    previousClose =
+                        Number(
+                            daily[
+                                daily.length - 2
+                            ].close
+                        );
+
+                }
+
+            }
+
+
+            const price =
+                Number(
+                    latestDaily.close
+                );
+
+
+            const dailyVolume =
+                Number(
+                    latestDaily.volume
+                );
+
+
+            // =================================================
+            // FINAL VALIDATION
+            // =================================================
+
+            if (
+
+                Number.isFinite(
+                    price
+                )
+
+                &&
+
+                price > 0
+
+                &&
+
+                Number.isFinite(
+                    previousClose
+                )
+
+                &&
+
+                previousClose > 0
+
+                &&
+
+                Number.isFinite(
+                    dailyVolume
+                )
+
+            ) {
+
+                const change =
+                    (
+                        (
+                            price -
+                            previousClose
+                        )
+                        /
+                        previousClose
+                    )
+                    *
+                    100;
+
+
+                console.log(
+                    `🔥 EXACT NSE DAILY RESULT ${symbol}:`,
+                    {
+                        price,
+                        previousClose,
+                        change,
+                        dailyVolume
+                    }
+                );
+
+
+                return {
+
+                    price,
+
+                    previousClose,
+
+                    dailyChange:
+                        change,
+
+                    dailyVolume
+
+                };
+
+            }
+
+        }
+
+
+        console.warn(
+            `⚠️ NSE daily data could not be parsed for ${symbol}`
+        );
+
+    }
+
+    catch (error) {
+
+        console.error(
+            `❌ NSE DAILY HISTORY ERROR ${symbol}:`,
+            error.message
+        );
+
+    }
+
+
+    // ========================================================
+    // FALLBACK
+    // ========================================================
+    //
+    // Only used if NSE daily endpoint genuinely failed.
+    //
+    // ========================================================
+
+    console.warn(
+        `⚠️ FALLBACK TO INTRADAY FOR ${symbol}`
+    );
+
+
+    const ordered =
+        [...candles].sort(
+            (a, b) =>
+                new Date(
+                    a.time
+                ).getTime()
+                -
+                new Date(
+                    b.time
+                ).getTime()
+        );
+
+
+    const latest =
+        ordered[
+            ordered.length - 1
+        ];
+
+
+    const price =
+        Number(
+            latest?.close
+        );
+
+
+    if (
+        !Number.isFinite(price)
+        ||
+        price <= 0
+    ) {
+
+        return null;
+
+    }
+
+
+    const latestDay =
+        getIstDateKey(
+            latest.time
+        );
+
+
+    if (!latestDay) {
+        return null;
+    }
+
+
+    const todayCandles =
+        ordered.filter(
+            candle =>
+                getIstDateKey(
+                    candle.time
+                )
+                ===
+                latestDay
+        );
+
+
+    const previousDays =
+        [
+            ...new Set(
+                ordered
+                    .map(
+                        candle =>
+                            getIstDateKey(
+                                candle.time
+                            )
+                    )
+                    .filter(Boolean)
+                    .filter(
+                        day =>
+                            day < latestDay
+                    )
+            )
+        ]
+        .sort();
+
+
+    const previousDay =
+        previousDays[
+            previousDays.length - 1
+        ];
+
+
+    if (
+        !previousDay
+        ||
+        todayCandles.length === 0
+    ) {
+
+        return null;
+
+    }
+
+
+    const previousDayCandles =
+        ordered.filter(
+            candle =>
+                getIstDateKey(
+                    candle.time
+                )
+                ===
+                previousDay
+        );
+
+
+    const previousClose =
+        Number(
+            previousDayCandles[
+                previousDayCandles.length - 1
+            ]?.close
+        );
+
+
+    const dailyVolume =
+        todayCandles.reduce(
+            (sum, candle) =>
+                sum +
+                Number(
+                    candle.volume || 0
+                ),
+            0
+        );
+
+
+    if (
+        !Number.isFinite(
+            previousClose
+        )
+        ||
+        previousClose <= 0
+    ) {
+
+        return null;
+
+    }
+
+
+    const change =
+        (
+            (
+                price -
+                previousClose
+            )
+            /
+            previousClose
+        )
+        *
+        100;
+
+
+    return {
+
+        price,
+
+        previousClose,
+
+        dailyChange:
+            change,
+
+        dailyVolume
+
+    };
+
+}
+
+
+async function getNseLiveResultStats(
+    symbol,
+    timeframe = "5m"
+) {
+
+    const candles =
+        await getNseCandles(
+            symbol,
+            timeframe
+        );
+
+    const stats =
+        await getNseResultStatsFromCandles(
+            symbol,
+            candles
+        );
+
+    if (!stats) {
+        throw new Error(
+            `Could not calculate NSE result values for ${symbol}`
+        );
+    }
+
+    return stats;
+}
+
+
+// ------------------------------------------------------------
+// NSE SCANNER DIAGNOSTIC ROUTE
+// ------------------------------------------------------------
+// This route DOES NOT change scanner behavior.
+// It only shows the exact NSE candle/volume calculation
+// so we can compare EMA360 with Chartink.
+
+app.get("/api/scanner/nse/diagnostic", async (req, res) => {
+
+    try {
+
+        const symbol = String(
+            req.query.symbol || "ADSL"
+        )
+            .trim()
+            .toUpperCase();
+
+        const timeframe = String(
+            req.query.timeframe || "5m"
+        )
+            .trim()
+            .toLowerCase();
+
+
+        // For now we are diagnosing the exact
+        // 5-minute condition from Chartink.
+        if (timeframe !== "5m") {
+
+            return res.status(400).json({
+
+                success: false,
+
+                message:
+                    "Diagnostic currently supports 5m only."
+
+            });
+
+        }
+
+
+        // Get RAW NSE candles.
+        // This includes the latest candle even if it
+        // has not completely finished yet.
+        const rawCandles =
+            await getNseCandles(
+                symbol,
+                timeframe,
+                true
+            );
+
+
+        if (!rawCandles.length) {
+
+            return res.json({
+
+                success: false,
+
+                source: "NSE",
+
+                symbol,
+
+                timeframe,
+
+                message:
+                    "No NSE candle data available"
+
+            });
+
+        }
+
+
+        // Get only completed candles.
+        const completedCandles =
+            keepOnlyCompletedCandles(
+                rawCandles,
+                timeframe
+            );
+
+
+        const latestRaw =
+            rawCandles[
+            rawCandles.length - 1
+            ] || null;
+
+
+        const latestCompleted =
+            completedCandles[
+            completedCandles.length - 1
+            ] || null;
+
+
+        // ----------------------------------------------------
+        // VOLUME DATA
+        // ----------------------------------------------------
+
+        const completedVolumes =
+            completedCandles
+                .map(
+                    candle =>
+                        Number(candle.volume)
+                )
+                .filter(
+                    Number.isFinite
+                );
+
+
+        const latestVolume =
+            latestCompleted
+                ? Number(
+                    latestCompleted.volume
+                )
+                : null;
+
+
+        // ----------------------------------------------------
+        // SMA(10)
+        // ----------------------------------------------------
+        //
+        // Version 1:
+        // latest candle + previous 9 candles
+        //
+        // Version 2:
+        // 10 candles BEFORE latest candle
+        //
+        // We calculate BOTH so we can determine
+        // which interpretation matches Chartink.
+        // ----------------------------------------------------
+
+
+        const last10IncludingLatest =
+            completedVolumes.slice(-10);
+
+
+        const previous10 =
+            completedVolumes.slice(-11, -1);
+
+
+        function calculateSMA(values) {
+
+            if (values.length !== 10) {
+
+                return null;
+
+            }
+
+            return (
+                values.reduce(
+                    (sum, value) =>
+                        sum + value,
+                    0
+                ) / 10
+            );
+
+        }
+
+
+        const sma10IncludingLatest =
+            calculateSMA(
+                last10IncludingLatest
+            );
+
+
+        const sma10Previous10 =
+            calculateSMA(
+                previous10
+            );
+
+
+        // ----------------------------------------------------
+        // 2 × SMA
+        // ----------------------------------------------------
+
+        const thresholdIncludingLatest =
+            sma10IncludingLatest === null
+                ? null
+                : sma10IncludingLatest * 2;
+
+
+        const thresholdPrevious10 =
+            sma10Previous10 === null
+                ? null
+                : sma10Previous10 * 2;
+
+
+        // ----------------------------------------------------
+        // PASS / FAIL
+        // ----------------------------------------------------
+
+        const passesIncludingLatest =
+            Number.isFinite(latestVolume) &&
+            Number.isFinite(
+                thresholdIncludingLatest
+            ) &&
+            latestVolume >
+            thresholdIncludingLatest;
+
+
+        const passesPrevious10 =
+            Number.isFinite(latestVolume) &&
+            Number.isFinite(
+                thresholdPrevious10
+            ) &&
+            latestVolume >
+            thresholdPrevious10;
+
+
+        // ----------------------------------------------------
+        // LAST 12 COMPLETED CANDLES
+        // ----------------------------------------------------
+
+        const last12 =
+            completedCandles
+                .slice(-12)
+                .map(
+                    (
+                        candle,
+                        index,
+                        arr
+                    ) => ({
+
+                        index:
+                            completedCandles.length -
+                            arr.length +
+                            index,
+
+                        time:
+                            candle.time,
+
+                        iso:
+                            new Date(
+                                candle.time
+                            ).toISOString(),
+
+                        volume:
+                            Number(
+                                candle.volume
+                            ),
+
+                        close:
+                            Number(
+                                candle.close
+                            ),
+
+                        isLatestCompleted:
+                            index ===
+                            arr.length - 1
+
+                    })
+                );
+
+
+        // ----------------------------------------------------
+        // RETURN DIAGNOSTIC DATA
+        // ----------------------------------------------------
+
+        return res.json({
+
+            success: true,
+
+            source: "NSE",
+
+            symbol,
+
+            timeframe,
+
+            generatedAt:
+                new Date().toISOString(),
+
+
+            // Candle counts
+            rawCandleCount:
+                rawCandles.length,
+
+            completedCandleCount:
+                completedCandles.length,
+
+
+            // Latest candles
+            latestRaw,
+
+            latestCompleted,
+
+
+            latestRawIsDifferentFromCompleted:
+                Boolean(
+                    latestRaw &&
+                    latestCompleted
+                ) &&
+                latestRaw.time !==
+                latestCompleted.time,
+
+
+            // Latest volume
+            latestVolume,
+
+
+            // SMA including latest candle
+            last10IncludingLatest,
+
+            sma10IncludingLatest,
+
+            thresholdIncludingLatest,
+
+            passesIncludingLatest,
+
+
+            // SMA using previous 10 candles
+            previous10,
+
+            sma10Previous10,
+
+            thresholdPrevious10,
+
+            passesPrevious10,
+
+
+            // Detailed candle list
+            last12CompletedCandles:
+                last12
+
+        });
+
+
+    } catch (error) {
+
+        console.error(
+            `NSE diagnostic error for ${req.query.symbol ||
+            "unknown"
+            }:`,
+            error.message
+        );
+
+
+        return res.status(500).json({
+
+            success: false,
+
+            source: "NSE",
+
+            message:
+                error.message
+
+        });
+
+    }
+
+});
+
+app.get("/api/scanner/nse/check-adsl", async (req, res) => {
+    try {
+        const symbol = "ADSL";
+        const timeframe = "5m";
+
+        const candles = await getNseCandles(
+    symbol,
+    timeframe
+);
+
+if (!candles || candles.length === 0) {
+    return res.json({
+        success: false,
+        message: "No candles"
+    });
+}
+
+const stats =
+    await getNseResultStatsFromCandles(
+        symbol,
+        candles
+    );
+
+        return res.json({
+            success: true,
+            symbol,
+            timeframe,
+
+            price: stats.price,
+            change: stats.dailyChange,
+
+            volume: stats.dailyVolume,
+            dailyVolume: stats.dailyVolume,
+
+            candleCount: candles.length,
+
+            latestCandle:
+                candles[candles.length - 1]
+        });
+
+    } catch (error) {
+
+        console.error(
+            "ADSL CHECK ERROR:",
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ------------------------------------------------------------
+// NSE MARKET DATA ROUTE
+// Used by EMA360 Guest mode.
+// Equity symbols use the same NSE candle engine as the scanner.
+// NIFTY 50 is handled through NSE index APIs because it is an index,
+// not an equity symbol.
+// ------------------------------------------------------------
+function normalizeNseIndexHistorical(raw) {
+    const rows = [];
+
+    const collect = value => {
+        if (Array.isArray(value)) {
+            for (const item of value) {
+                if (Array.isArray(item)) {
+                    rows.push(item);
+                } else if (item && typeof item === "object") {
+                    if (Array.isArray(item.data)) {
+                        collect(item.data);
+                    } else {
+                        rows.push(item);
+                    }
+                }
+            }
+            return;
+        }
+
+        if (value && typeof value === "object") {
+            if (Array.isArray(value.data)) {
+                collect(value.data);
+            } else {
+                rows.push(value);
+            }
+        }
+    };
+
+    collect(raw);
+
+    return rows
+        .map(row => {
+            if (Array.isArray(row)) {
+                const timeValue = Number(row[0]);
+                const closeValue = Number(row[row.length - 1]);
+
+                if (!Number.isFinite(timeValue) || !Number.isFinite(closeValue)) {
+                    return null;
+                }
+
+                const time =
+                    timeValue < 1e12
+                        ? new Date(timeValue * 1000).toISOString()
+                        : new Date(timeValue).toISOString();
+
+                return {
+                    time,
+                    o: closeValue,
+                    h: closeValue,
+                    l: closeValue,
+                    c: closeValue,
+                    v: 0
+                };
+            }
+
+            const time =
+                row?.time ??
+                row?.timestamp ??
+                row?.date ??
+                row?.indexDate ??
+                row?.tradeDate ??
+                row?.mTimestamp ??
+                row?.mtimestamp;
+
+            const open = Number(
+                row?.open ??
+                row?.openPrice ??
+                row?.CH_OPENING_PRICE ??
+                row?.chOpeningPrice
+            );
+
+            const high = Number(
+                row?.high ??
+                row?.highPrice ??
+                row?.dayHigh ??
+                row?.CH_TRADE_HIGH_PRICE ??
+                row?.chTradeHighPrice
+            );
+
+            const low = Number(
+                row?.low ??
+                row?.lowPrice ??
+                row?.dayLow ??
+                row?.CH_TRADE_LOW_PRICE ??
+                row?.chTradeLowPrice
+            );
+
+            const close = Number(
+                row?.close ??
+                row?.closePrice ??
+                row?.last ??
+                row?.lastPrice ??
+                row?.CH_CLOSING_PRICE ??
+                row?.chClosingPrice
+            );
+
+            const volume = Number(
+                row?.volume ??
+                row?.totalTradedVolume ??
+                row?.CH_TOT_TRADED_QTY ??
+                row?.chTotTradedQty ??
+                0
+            );
+
+            if (!time || !Number.isFinite(close)) {
+                return null;
+            }
+
+            const parsedTime = new Date(time);
+
+            if (!Number.isFinite(parsedTime.getTime())) {
+                return null;
+            }
+
+            const safeOpen = Number.isFinite(open) ? open : close;
+            const safeHigh = Number.isFinite(high) ? high : close;
+            const safeLow = Number.isFinite(low) ? low : close;
+
+            return {
+                time: parsedTime.toISOString(),
+                o: safeOpen,
+                h: safeHigh,
+                l: safeLow,
+                c: close,
+                v: Number.isFinite(volume) ? volume : 0
+            };
+        })
+        .filter(Boolean)
+        .sort((a, b) => new Date(a.time) - new Date(b.time));
+}
+
+function normalizeNseIndexIntradayCandles(graph, timeframe = "5m") {
+    const intervalMinutes =
+        timeframe === "1m" ? 1 :
+        timeframe === "3m" ? 3 :
+        timeframe === "5m" ? 5 :
+        timeframe === "15m" ? 15 :
+        timeframe === "30m" ? 30 :
+        timeframe === "1h" ? 60 :
+        null;
+
+    if (!intervalMinutes || !Array.isArray(graph)) {
+        return [];
+    }
+
+    const buckets = new Map();
+
+    for (const point of graph) {
+        if (!Array.isArray(point) || point.length < 2) {
+            continue;
+        }
+
+        const rawTime = Number(point[0]);
+        const price = Number(point[1]);
+
+        if (!Number.isFinite(rawTime) || !Number.isFinite(price)) {
+            continue;
+        }
+
+        const date = new Date(
+            rawTime < 1e12
+                ? rawTime * 1000
+                : rawTime
+        );
+
+        if (!Number.isFinite(date.getTime())) {
+            continue;
+        }
+
+        /*
+         * NSE index intraday data is a price/time series, not an OHLCV
+         * candle series. Build genuine OHLC candles from the points instead
+         * of pretending O=H=L=C for every point.
+         *
+         * The bucket is calculated in IST because NSE's trading session is
+         * defined in India time.
+         */
+        const istParts = new Intl.DateTimeFormat("en-GB", {
+            timeZone: "Asia/Kolkata",
+            year: "numeric",
+            month: "2-digit",
+            day: "2-digit",
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false
+        }).formatToParts(date);
+
+        const part = type =>
+            istParts.find(item => item.type === type)?.value;
+
+        const year = Number(part("year"));
+        const month = Number(part("month"));
+        const day = Number(part("day"));
+        const hour = Number(part("hour"));
+        const minute = Number(part("minute"));
+
+        if (
+            !Number.isFinite(year) ||
+            !Number.isFinite(month) ||
+            !Number.isFinite(day) ||
+            !Number.isFinite(hour) ||
+            !Number.isFinite(minute)
+        ) {
+            continue;
+        }
+
+        const totalMinutes = hour * 60 + minute;
+
+        /* NSE cash/index session: 09:15 through 15:30 IST. */
+        if (totalMinutes < 9 * 60 + 15 || totalMinutes > 15 * 60 + 30) {
+            continue;
+        }
+
+        const sessionMinutes = totalMinutes - (9 * 60 + 15);
+        const bucketOffset =
+            Math.floor(sessionMinutes / intervalMinutes) * intervalMinutes;
+
+        const bucketMinutes =
+            9 * 60 + 15 + bucketOffset;
+
+        const bucketHour = Math.floor(bucketMinutes / 60);
+        const bucketMinute = bucketMinutes % 60;
+
+        /*
+         * Use an explicit +05:30 timestamp so the bucket is unambiguous when
+         * the frontend parses it back into a Date.
+         */
+        const bucketKey =
+            `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}T` +
+            `${String(bucketHour).padStart(2, "0")}:${String(bucketMinute).padStart(2, "0")}:00+05:30`;
+
+        let bucket = buckets.get(bucketKey);
+
+        if (!bucket) {
+            bucket = {
+                time: bucketKey,
+                o: price,
+                h: price,
+                l: price,
+                c: price,
+                v: 0,
+                firstTimestamp: date.getTime()
+            };
+            buckets.set(bucketKey, bucket);
+        } else {
+            bucket.h = Math.max(bucket.h, price);
+            bucket.l = Math.min(bucket.l, price);
+            bucket.c = price;
+        }
+    }
+
+    return Array.from(buckets.values())
+        .sort((a, b) => a.firstTimestamp - b.firstTimestamp)
+        .map(candle => {
+            const { firstTimestamp, ...normalized } = candle;
+            return normalized;
+        });
+}
+
+function normalizeMarketCandleShape(candles) {
+    if (!Array.isArray(candles)) {
+        return [];
+    }
+
+    return candles
+        .map(candle => {
+            const rawTime =
+                candle?.time ??
+                candle?.timestamp ??
+                candle?.date;
+
+            const timeNumber = Number(rawTime);
+            let time;
+
+            if (Number.isFinite(timeNumber)) {
+                time =
+                    new Date(
+                        timeNumber < 1e12
+                            ? timeNumber * 1000
+                            : timeNumber
+                    ).toISOString();
+            } else {
+                const parsed = new Date(rawTime);
+                time = Number.isFinite(parsed.getTime())
+                    ? parsed.toISOString()
+                    : null;
+            }
+
+            const open = Number(
+                candle?.o ?? candle?.open
+            );
+            const high = Number(
+                candle?.h ?? candle?.high
+            );
+            const low = Number(
+                candle?.l ?? candle?.low
+            );
+            const close = Number(
+                candle?.c ?? candle?.close
+            );
+            const volume = Number(
+                candle?.v ?? candle?.volume ?? 0
+            );
+
+            if (
+                !time ||
+                !Number.isFinite(open) ||
+                !Number.isFinite(high) ||
+                !Number.isFinite(low) ||
+                !Number.isFinite(close)
+            ) {
+                return null;
+            }
+
+            return {
+                time,
+                o: open,
+                h: high,
+                l: low,
+                c: close,
+                v: Number.isFinite(volume) ? volume : 0
+            };
+        })
+        .filter(Boolean)
+        .sort(
+            (a, b) =>
+                new Date(a.time) - new Date(b.time)
+        );
+}
+
+async function getNseMarketCandles(symbol, timeframe = "5m") {
+    const normalizedSymbol = String(symbol || "")
+        .trim()
+        .toUpperCase();
+
+    if (normalizedSymbol !== "NIFTY 50") {
+        // Guest Market Data must include the currently forming candle.
+        // The scanner continues to use completed candles separately.
+        const equityCandles =
+            await getNseCandles(
+                normalizedSymbol,
+                timeframe,
+                true
+            );
+
+        return normalizeMarketCandleShape(
+            equityCandles
+        );
+    }
+
+    /*
+     * NIFTY 50 is an NSE index, so it must not go through the
+     * equity-symbol/token lookup used for stocks.
+     *
+     * IMPORTANT FIX:
+     *
+     * getIndexIntradayData() returns a time/price graph, not OHLC candles.
+     * The old NSE guest implementation converted every point into:
+     *
+     *     O = H = L = C
+     *     V = 0
+     *
+     * That made the candlesticks invisible and produced bad RSI/ADX/EMA
+     * calculations. NSE's charting service supports historical OHLC data
+     * for Index symbols too, so use that first.
+     */
+
+    const timeframeConfig = {
+        "1m": {
+            interval: 1,
+            days: 15
+        },
+        "3m": {
+            interval: 3,
+            days: 30
+        },
+        "5m": {
+            interval: 5,
+            days: 60
+        },
+        "15m": {
+            interval: 15,
+            days: 120
+        },
+        "30m": {
+            interval: 30,
+            days: 180
+        },
+        "1h": {
+            interval: 60,
+            days: 365
+        },
+        "1d": {
+            interval: "D",
+            days: 1000
+        }
+    };
+
+    const config = timeframeConfig[timeframe];
+
+    if (!config) {
+        throw new Error(
+            `Unsupported NSE NIFTY timeframe: ${timeframe}`
+        );
+    }
+
+    const now = new Date();
+
+    const start = new Date(
+        now.getTime() -
+        config.days * 24 * 60 * 60 * 1000
+    );
+
+    /*
+     * First choice: NSE charting OHLC for the index.
+     *
+     * stock-nse-india exposes the same charting endpoint through
+     * getEquityChartHistoricalData(), with symbolType = "Index".
+     */
+    try {
+        // Let stock-nse-india resolve the charting symbol from NSE.
+        // The segment is optional; forcing IDX can return no token on
+        // versions where the index is exposed under the generic charting
+        // symbol lookup.
+        const symbolInfo =
+            await nseIndia.getEquitySymbolInfo(
+                "NIFTY 50"
+            );
+
+        const token =
+            symbolInfo?.scripcode ||
+            symbolInfo?.scripCode ||
+            symbolInfo?.token;
+
+        if (!token) {
+            throw new Error(
+                "NIFTY 50 charting token was not returned by NSE"
+            );
+        }
+
+        console.log(
+            "🇮🇳 NIFTY 50 NSE CHART TOKEN:",
+            token
+        );
+
+        const chartResponse =
+            await nseIndia.getEquityChartHistoricalData(
+                "NIFTY 50",
+                {
+                    start,
+                    end: now
+                },
+                token,
+                "Index",
+                timeframe === "1d" ? "D" : "I",
+                config.interval
+            );
+
+        const candles =
+            normalizeMarketCandleShape(
+                normalizeNseCandles(chartResponse)
+            );
+
+        console.log(
+            "🇮🇳 NIFTY 50 NSE INDEX OHLC:",
+            timeframe,
+            "candles =",
+            candles.length,
+            "last =",
+            candles.at(-1)
+        );
+
+        if (candles.length) {
+            return candles;
+        }
+
+        throw new Error(
+            "NSE index charting returned no OHLC candles"
+        );
+
+    } catch (chartError) {
+        console.error(
+            `⚠️ NIFTY 50 NSE charting OHLC failed for ${timeframe}:`,
+            chartError?.message || chartError
+        );
+    }
+
+    /*
+     * Fallback 1: daily index history.
+     */
+    if (timeframe === "1d") {
+        try {
+            const historical =
+                await nseIndia.getIndexHistoricalData(
+                    "NIFTY 50",
+                    { start, end: now }
+                );
+
+            const candles =
+                normalizeMarketCandleShape(
+                    normalizeNseIndexHistorical(historical)
+                );
+
+            if (candles.length) {
+                return candles;
+            }
+        } catch (historicalError) {
+            console.error(
+                "⚠️ NIFTY 50 NSE daily fallback failed:",
+                historicalError?.message || historicalError
+            );
+        }
+    }
+
+    /*
+     * Fallback 2: current-day index graph.
+     *
+     * This fallback is deliberately used only when charting OHLC is
+     * unavailable. We aggregate the real NSE price points into OHLC candles
+     * instead of creating zero-height O=H=L=C candles.
+     *
+     * NIFTY spot index data does not provide traded candle volume here, so
+     * volume remains 0 rather than inventing fake volume.
+     */
+    try {
+        const intraday =
+            await nseIndia.getIndexIntradayData(
+                "NIFTY 50"
+            );
+
+        const graph =
+            intraday?.grapthData ||
+            intraday?.graphData ||
+            [];
+
+        return normalizeMarketCandleShape(
+            normalizeNseIndexIntradayCandles(
+                graph,
+                timeframe
+            )
+        );
+    } catch (intradayError) {
+        console.error(
+            "❌ NIFTY 50 NSE intraday fallback failed:",
+            intradayError?.message || intradayError
+        );
+
+        return [];
+    }
+}
+
+/* ============================================================
+   NSE GUEST LIVE QUOTE
+
+   Historical/chart endpoints give candle snapshots. They are NOT a
+   tick-by-tick stream. Guest mode therefore uses the NSE quote endpoints
+   for the currently selected stock and the React client polls this route.
+
+   Angel One is completely untouched.
+============================================================ */
+
+const NSE_MARKET_QUOTE_CACHE = new Map();
+const NSE_MARKET_QUOTE_INFLIGHT = new Map();
+const NSE_MARKET_QUOTE_CACHE_MS = 1000;
+
+function nseWebHeaders(symbol) {
+    return {
+        "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer":
+            `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(symbol)}`,
+        "Accept-Language": "en-US,en;q=0.9"
+    };
+}
+
+async function fetchNseMarketQuote(symbol) {
+    const normalizedSymbol = String(symbol || "")
+        .trim()
+        .toUpperCase();
+
+    if (!normalizedSymbol) {
+        throw new Error("Symbol is required");
+    }
+
+    const cached = NSE_MARKET_QUOTE_CACHE.get(normalizedSymbol);
+    if (
+        cached &&
+        Date.now() - cached.timestamp < NSE_MARKET_QUOTE_CACHE_MS
+    ) {
+        return cached.data;
+    }
+
+    const existing = NSE_MARKET_QUOTE_INFLIGHT.get(normalizedSymbol);
+    if (existing) {
+        return existing;
+    }
+
+    const request = (async () => {
+        try {
+            let result;
+
+            if (normalizedSymbol === "NIFTY 50") {
+                // This package method uses NSE's index endpoint and handles
+                // the NSE session/cookie flow for us.
+                const indexData =
+                    await nseIndia.getEquityStockIndices("NIFTY 50");
+
+                const meta = indexData?.metadata || {};
+                const price = Number(meta.last);
+                const previousClose = Number(meta.previousClose);
+
+                if (!Number.isFinite(price) || price <= 0) {
+                    throw new Error(
+                        "NSE NIFTY 50 current price was not returned"
+                    );
+                }
+
+                const change =
+                    Number.isFinite(previousClose) && previousClose > 0
+                        ? ((price - previousClose) / previousClose) * 100
+                        : Number(meta.percChange);
+
+                result = {
+                    source: "NSE",
+                    symbol: normalizedSymbol,
+                    price,
+                    previousClose:
+                        Number.isFinite(previousClose)
+                            ? previousClose
+                            : null,
+                    change:
+                        Number.isFinite(change)
+                            ? change
+                            : null,
+                    // NIFTY spot is an index, not a traded share/security.
+                    // Do not feed aggregate index volume into candle volume.
+                    volume: null,
+                    open: Number(meta.open) || null,
+                    high: Number(meta.high) || null,
+                    low: Number(meta.low) || null,
+                    timestamp: new Date().toISOString()
+                };
+            } else {
+                const details =
+                    await nseIndia.getEquityDetails(
+                        normalizedSymbol
+                    );
+
+                const priceInfo = details?.priceInfo || {};
+
+                let totalVolume = null;
+
+                try {
+                    const tradeInfo =
+                        await nseIndia.getEquityTradeInfo(
+                            normalizedSymbol
+                        );
+
+                    const value = Number(
+                        tradeInfo?.marketDeptOrderBook
+                            ?.tradeInfo
+                            ?.totalTradedVolume
+                    );
+
+                    if (Number.isFinite(value)) {
+                        totalVolume = value;
+                    }
+                } catch (volumeError) {
+                    console.warn(
+                        `⚠️ NSE volume unavailable for ${normalizedSymbol}:`,
+                        volumeError?.message || volumeError
+                    );
+                }
+
+                const price = Number(priceInfo.lastPrice);
+                const previousClose = Number(priceInfo.previousClose);
+
+                if (!Number.isFinite(price) || price <= 0) {
+                    throw new Error(
+                        `NSE current price was not returned for ${normalizedSymbol}`
+                    );
+                }
+
+                const change =
+                    Number.isFinite(previousClose) && previousClose > 0
+                        ? ((price - previousClose) / previousClose) * 100
+                        : Number(priceInfo.pChange);
+
+                result = {
+                    source: "NSE",
+                    symbol: normalizedSymbol,
+                    price,
+                    previousClose:
+                        Number.isFinite(previousClose)
+                            ? previousClose
+                            : null,
+                    change:
+                        Number.isFinite(change)
+                            ? change
+                            : null,
+                    volume: totalVolume,
+                    open: Number(priceInfo.open) || null,
+                    high: Number(priceInfo.intraDayHighLow?.max) || null,
+                    low: Number(priceInfo.intraDayHighLow?.min) || null,
+                    vwap: Number(priceInfo.vwap) || null,
+                    timestamp: new Date().toISOString()
+                };
+            }
+
+            NSE_MARKET_QUOTE_CACHE.set(normalizedSymbol, {
+                timestamp: Date.now(),
+                data: result
+            });
+
+            return result;
+        } finally {
+            NSE_MARKET_QUOTE_INFLIGHT.delete(normalizedSymbol);
+        }
+    })();
+
+    NSE_MARKET_QUOTE_INFLIGHT.set(normalizedSymbol, request);
+    return request;
+}
+
+/* ============================================================
+   NSE NIFTY 50 CONSTITUENT SNAPSHOT
+
+   One NSE index request gives the current values for the NIFTY 50
+   constituents. Guest mode uses this endpoint to keep the entire
+   50-stock table synchronized without waiting for a click.
+============================================================ */
+
+const NSE_NIFTY50_QUOTES_CACHE_KEY = "NIFTY 50";
+let NSE_NIFTY50_QUOTES_CACHE = {
+    timestamp: 0,
+    quotes: {}
+};
+
+function pickNumber(...values) {
+    for (const value of values) {
+        const n = Number(value);
+        if (Number.isFinite(n)) return n;
+    }
+    return null;
+}
+
+function normalizeNseIndexConstituentRows(payload) {
+    const rows = Array.isArray(payload?.data)
+        ? payload.data
+        : Array.isArray(payload)
+            ? payload
+            : [];
+
+    const quotes = {};
+
+    for (const row of rows) {
+        const rawSymbol = String(
+            row?.symbol ||
+            row?.identifier ||
+            row?.securityId ||
+            row?.securitySymbol ||
+            ""
+        ).trim().toUpperCase();
+
+        // NSE responses can expose an equity as RELIANCE-EQ (or a
+        // similar security suffix).  The React app uses the plain
+        // NSE trading symbol, so normalize those variants here.
+        const symbol = rawSymbol
+            .replace(/[-_](EQ|BE|BZ|SM)$/i, "")
+            .trim();
+
+        if (!symbol) continue;
+
+        const price = pickNumber(
+            row?.lastPrice,
+            row?.ltp,
+            row?.last,
+            row?.close
+        );
+
+        if (!Number.isFinite(price) || price <= 0) continue;
+
+        const previousClose = pickNumber(
+            row?.previousClose,
+            row?.prevClose,
+            row?.prev_close
+        );
+
+        const change =
+            Number.isFinite(previousClose) && previousClose > 0
+                ? ((price - previousClose) / previousClose) * 100
+                : pickNumber(row?.pChange, row?.percentChange);
+
+        quotes[symbol] = {
+            source: "NSE",
+            symbol,
+            price,
+            previousClose,
+            change: Number.isFinite(change) ? change : null,
+            volume: pickNumber(
+                row?.totalTradedVolume,
+                row?.totalTradedQty,
+                row?.tradedVolume
+            ),
+            open: pickNumber(row?.open),
+            high: pickNumber(row?.dayHigh, row?.high),
+            low: pickNumber(row?.dayLow, row?.low),
+            vwap: pickNumber(row?.vwap),
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    return quotes;
+}
+
+async function fetchNseNifty50Quotes() {
+    const now = Date.now();
+
+    if (
+        NSE_NIFTY50_QUOTES_CACHE.timestamp &&
+        now - NSE_NIFTY50_QUOTES_CACHE.timestamp < 1500 &&
+        Object.keys(NSE_NIFTY50_QUOTES_CACHE.quotes).length
+    ) {
+        return NSE_NIFTY50_QUOTES_CACHE.quotes;
+    }
+
+    const indexData =
+        await nseIndia.getEquityStockIndices(
+            NSE_NIFTY50_QUOTES_CACHE_KEY
+        );
+
+    const quotes =
+        normalizeNseIndexConstituentRows(indexData);
+
+    // RELIANCE is a NIFTY 50 constituent. If the bulk NSE snapshot
+    // omits it for a transient response-format/API issue, recover it
+    // from the dedicated NSE equity quote endpoint instead of leaving
+    // the dashboard card blank. This is intentionally limited to a
+    // missing symbol so normal market-wide polling is not multiplied
+    // into 50 individual requests.
+    if (!quotes.RELIANCE) {
+        try {
+            const relianceQuote = await fetchNseMarketQuote("RELIANCE");
+            if (relianceQuote) {
+                quotes.RELIANCE = relianceQuote;
+            }
+        } catch (error) {
+            console.warn(
+                "⚠️ NSE RELIANCE fallback quote unavailable:",
+                error?.message || error
+            );
+        }
+    }
+
+    /*
+       The constituent endpoint returns the 50 stocks, but the
+       selected dashboard can also be NIFTY 50 itself.  NIFTY 50
+       is an index, so fetch its own NSE quote separately and keep
+       it in the same snapshot.  This makes the large selected-stock
+       header update automatically instead of waiting for a click.
+    */
+    try {
+        const niftyQuote = await fetchNseMarketQuote("NIFTY 50");
+        if (niftyQuote) {
+            quotes["NIFTY 50"] = niftyQuote;
+        }
+    } catch (error) {
+        console.warn(
+            "⚠️ NSE NIFTY 50 index quote unavailable during constituent poll:",
+            error?.message || error
+        );
+    }
+
+    // Keep a partial response rather than fabricating missing prices.
+    if (!Object.keys(quotes).length) {
+        throw new Error(
+            "NSE NIFTY 50 constituent prices were not returned"
+        );
+    }
+
+    NSE_NIFTY50_QUOTES_CACHE = {
+        timestamp: Date.now(),
+        quotes
+    };
+
+    return quotes;
+}
+
+app.get("/api/market/nse/quotes", async (req, res) => {
+    try {
+        const quotes = await fetchNseNifty50Quotes();
+
+        return res.json({
+            success: true,
+            source: "NSE",
+            count: Object.keys(quotes).length,
+            quotes
+        });
+    } catch (error) {
+        console.error(
+            "❌ NSE NIFTY 50 quotes failed:",
+            error?.message || error
+        );
+
+        return res.status(502).json({
+            success: false,
+            source: "NSE",
+            message:
+                error?.message ||
+                "NSE NIFTY 50 quotes failed"
+        });
+    }
+});
+
+/* ============================================================
+   NSE INDEX MARKET CARDS
+
+   Guest mode must not reuse Angel One values for the header.
+   SENSEX belongs to BSE, so when the NSE-only source does not
+   provide it, the frontend will correctly show -- rather than
+   silently using another exchange.
+============================================================ */
+
+const NSE_HEADER_INDEX_ALIASES = {
+    "BANKNIFTY": ["NIFTY BANK", "BANKNIFTY"],
+    "FINNIFTY": ["NIFTY FIN SERVICE", "FINNIFTY"],
+    "NIFTY 50": ["NIFTY 50", "NIFTY"],
+    "NIFTYIT": ["NIFTY IT", "NIFTYIT"],
+    "NIFTYMIDCAP100": ["NIFTY MIDCAP 100", "NIFTYMIDCAP100"],
+    "NIFTYNXT50": ["NIFTY NEXT 50", "NIFTYNXT50"],
+    "NIFTYPHARMA": ["NIFTY PHARMA", "NIFTYPHARMA"],
+    "NIFTYSMALL100": ["NIFTY SMALL 100", "NIFTYSMALL100"]
+};
+
+function normalizeNseIndexRows(payload) {
+    const rows = Array.isArray(payload?.data)
+        ? payload.data
+        : Array.isArray(payload)
+            ? payload
+            : [];
+
+    const result = {};
+
+    for (const row of rows) {
+        const name = String(
+            row?.index ||
+            row?.indexSymbol ||
+            row?.name ||
+            ""
+        ).trim().toUpperCase();
+
+        if (!name) continue;
+
+        const price = pickNumber(
+            row?.last,
+            row?.lastPrice,
+            row?.ltp,
+            row?.close
+        );
+
+        if (!Number.isFinite(price)) continue;
+
+        const previousClose = pickNumber(
+            row?.previousClose,
+            row?.prevClose
+        );
+
+        const change =
+            Number.isFinite(previousClose) && previousClose > 0
+                ? ((price - previousClose) / previousClose) * 100
+                : pickNumber(row?.percentChange, row?.pChange);
+
+        result[name] = {
+            source: "NSE",
+            name,
+            price,
+            previousClose,
+            change: Number.isFinite(change) ? change : null,
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    return result;
+}
+
+let NSE_HEADER_INDICES_CACHE = {
+    timestamp: 0,
+    indices: {}
+};
+
+async function fetchNseHeaderIndices() {
+    const now = Date.now();
+
+    if (
+        NSE_HEADER_INDICES_CACHE.timestamp &&
+        now - NSE_HEADER_INDICES_CACHE.timestamp < 5000 &&
+        Object.keys(NSE_HEADER_INDICES_CACHE.indices).length
+    ) {
+        return NSE_HEADER_INDICES_CACHE.indices;
+    }
+
+    /*
+       stock-nse-india v1.4 exposes getEquityStockIndices(index)
+       for a specific NSE index.  Calling it without an index is not
+       a reliable way to obtain the complete ticker set, which is why
+       only NIFTY 50 was appearing before.
+
+       Fetch the exact NSE indices used by EMA360 and normalize their
+       metadata. SENSEX is intentionally excluded because it belongs
+       to BSE, not NSE.
+    */
+    const indexNames = [
+        ["BANKNIFTY", "NIFTY BANK"],
+        ["FINNIFTY", "NIFTY FIN SERVICE"],
+        ["NIFTY 50", "NIFTY 50"],
+        ["NIFTYIT", "NIFTY IT"],
+        ["NIFTYMIDCAP100", "NIFTY MIDCAP 100"],
+        ["NIFTYNXT50", "NIFTY NEXT 50"],
+        ["NIFTYPHARMA", "NIFTY PHARMA"],
+        ["NIFTYSMALL100", "NIFTY SMLCAP 100"]
+    ];
+
+    const entries = await Promise.all(
+        indexNames.map(async ([label, nseIndexName]) => {
+            try {
+                const indexData =
+                    await nseIndia.getEquityStockIndices(nseIndexName);
+
+                const meta = indexData?.metadata || {};
+                const price = pickNumber(
+                    meta.last,
+                    meta.lastPrice,
+                    meta.ltp,
+                    meta.close
+                );
+
+                if (!Number.isFinite(price)) {
+                    return [label, null];
+                }
+
+                const previousClose = pickNumber(
+                    meta.previousClose,
+                    meta.prevClose
+                );
+
+                const change =
+                    Number.isFinite(previousClose) && previousClose > 0
+                        ? ((price - previousClose) / previousClose) * 100
+                        : pickNumber(meta.percChange, meta.pChange);
+
+                return [
+                    label,
+                    {
+                        source: "NSE",
+                        name: label,
+                        price,
+                        previousClose,
+                        change: Number.isFinite(change) ? change : null,
+                        timestamp: new Date().toISOString()
+                    }
+                ];
+            } catch (error) {
+                console.warn(
+                    `⚠️ NSE header index ${nseIndexName} failed:`,
+                    error?.message || error
+                );
+                return [label, null];
+            }
+        })
+    );
+
+    const output = {};
+
+    for (const [label, value] of entries) {
+        if (value) {
+            output[label] = value;
+        }
+    }
+
+    /*
+       RELIANCE replaces SENSEX in the EMA360 header.
+       RELIANCE is an NSE equity, so it cannot be obtained from
+       getEquityStockIndices(). Fetch its live NSE equity quote and
+       expose it through the SAME marketIndices object used by Header.
+    */
+    try {
+        const relianceQuote = await fetchNseMarketQuote("RELIANCE");
+
+        if (relianceQuote && Number.isFinite(Number(relianceQuote.price))) {
+            output["RELIANCE"] = {
+                source: "NSE",
+                name: "RELIANCE",
+                price: Number(relianceQuote.price),
+                previousClose: Number.isFinite(Number(relianceQuote.previousClose))
+                    ? Number(relianceQuote.previousClose)
+                    : null,
+                change: Number.isFinite(Number(relianceQuote.change))
+                    ? Number(relianceQuote.change)
+                    : null,
+                timestamp: relianceQuote.timestamp || new Date().toISOString()
+            };
+        }
+    } catch (error) {
+        console.warn(
+            "⚠️ NSE header RELIANCE quote failed:",
+            error?.message || error
+        );
+    }
+
+    NSE_HEADER_INDICES_CACHE = {
+        timestamp: Date.now(),
+        indices: output
+    };
+
+    return output;
+}
+
+app.get("/api/market/nse/indices", async (req, res) => {
+    try {
+        const indices = await fetchNseHeaderIndices();
+
+        return res.json({
+            success: true,
+            source: "NSE",
+            indices
+        });
+    } catch (error) {
+        console.error(
+            "❌ NSE header indices failed:",
+            error?.message || error
+        );
+
+        return res.status(502).json({
+            success: false,
+            source: "NSE",
+            message:
+                error?.message ||
+                "NSE header indices failed"
+        });
+    }
+});
+
+app.get("/api/market/nse/quote", async (req, res) => {
+    try {
+        const symbol = String(req.query.symbol || "")
+            .trim()
+            .toUpperCase();
+
+        if (!symbol) {
+            return res.status(400).json({
+                success: false,
+                source: "NSE",
+                message: "Symbol is required"
+            });
+        }
+
+        const quote = await fetchNseMarketQuote(symbol);
+
+        return res.json({
+            success: true,
+            ...quote
+        });
+    } catch (error) {
+        console.error(
+            `❌ NSE guest quote failed for ${req.query.symbol || "unknown"}:`,
+            error?.message || error
+        );
+
+        return res.status(502).json({
+            success: false,
+            source: "NSE",
+            symbol: req.query.symbol || "",
+            message: error?.message || "NSE quote failed"
+        });
+    }
+});
+
+app.get("/api/market/nse/candles", async (req, res) => {
+    try {
+        const symbol = String(
+            req.query.symbol || ""
+        )
+            .trim()
+            .toUpperCase();
+
+        const timeframe = String(
+            req.query.timeframe || "5m"
+        )
+            .trim()
+            .toLowerCase();
+
+        const allowedTimeframes = [
+            "1m",
+            "3m",
+            "5m",
+            "15m",
+            "30m",
+            "1h",
+            "1d"
+        ];
+
+        if (!symbol) {
+            return res.status(400).json({
+                success: false,
+                source: "NSE",
+                message: "Symbol is required"
+            });
+        }
+
+        if (!allowedTimeframes.includes(timeframe)) {
+            return res.status(400).json({
+                success: false,
+                source: "NSE",
+                message: `Unsupported timeframe: ${timeframe}`,
+                allowedTimeframes
+            });
+        }
+
+        const candles = await getNseMarketCandles(
+            symbol,
+            timeframe
+        );
+
+        if (!Array.isArray(candles) || !candles.length) {
+            return res.status(404).json({
+                success: false,
+                source: "NSE",
+                symbol,
+                timeframe,
+                message: "No NSE market candles available"
+            });
+        }
+
+        return res.json({
+            success: true,
+            source: "NSE",
+            symbol,
+            timeframe,
+            candles
+        });
+
+    } catch (error) {
+        console.error(
+            `NSE market data error for ${req.query.symbol || "unknown"}:`,
+            error.message
+        );
+
+        return res.status(500).json({
+            success: false,
+            source: "NSE",
+            message: error.message
+        });
+    }
+});
+
+
+// ------------------------------------------------------------
+// NSE CANDLES ROUTE
+// ------------------------------------------------------------
+app.get("/api/scanner/nse/candles", async (req, res) => {
+    try {
+        const symbol = String(
+            req.query.symbol || ""
+        )
+            .trim()
+            .toUpperCase();
+
+        const timeframe = String(
+            req.query.timeframe || "5m"
+        )
+            .trim()
+            .toLowerCase();
+
+        const allowedTimeframes = [
+            "1m",
+            "3m",
+            "5m",
+            "15m",
+            "30m",
+            "1h",
+            "1d"
+        ];
+
+        if (!symbol) {
+            return res.status(400).json({
+                success: false,
+                message: "Symbol is required",
+            });
+        }
+
+        if (!allowedTimeframes.includes(timeframe)) {
+            return res.status(400).json({
+                success: false,
+                message: `Unsupported timeframe: ${timeframe}`,
+                allowedTimeframes
+            });
+        }
+
+        const candles = await getNseCandles(
+            symbol,
+            timeframe
+        );
+
+        if (!candles.length) {
+            return res.json({
+                success: false,
+                source: "NSE",
+                symbol,
+                timeframe,
+                candles: [],
+                message: "No NSE candle data available"
+            });
+        }
+
+        /*
+         * All displayed result values come from this SAME candle
+         * snapshot. No second NSE quote request is made here.
+         */
+        const stats =
+    await getNseResultStatsFromCandles(
+        symbol,
+        candles
+    );
+
+        if (!stats) {
+            return res.json({
+                success: false,
+                source: "NSE",
+                symbol,
+                timeframe,
+                candles: [],
+                message: "Not enough NSE candle history to calculate result values"
+            });
+        }
+
+        /*
+         * Company-name lookup is deliberately non-blocking.
+         * If NSE blocks the metadata request, the stock still appears.
+         */
+        let companyName = symbol;
+
+        try {
+            companyName =
+                await getNseCompanyName(symbol);
+        } catch {
+            companyName = symbol;
+        }
+
+        console.log(
+            "FINAL NSE RESULT:",
+            symbol,
+            {
+                price: stats.price,
+                change: stats.dailyChange,
+                volume: stats.dailyVolume
+            }
+        );
+        return res.json({
+            success: true,
+            source: "NSE",
+            symbol,
+            companyName,
+            timeframe,
+            candles,
+
+            price: stats.price,
+            previousClose: stats.previousClose,
+            change: stats.dailyChange,
+            volume: stats.dailyVolume,
+
+            dailyChange: stats.dailyChange,
+            dailyVolume: stats.dailyVolume,
+            latestCandle: candles[candles.length - 1]
+        });
+
+    } catch (error) {
+
+        console.error(
+            `NSE candle route error for ${req.query.symbol || "unknown"}:`,
+            error.message
+        );
+
+        return res.status(500).json({
+            success: false,
+            source: "NSE",
+            message: error.message,
+        });
+    }
+});
+
+
+// ------------------------------------------------------------
+// NSE LIVE QUOTE - PRICE / % CHANGE / VOLUME
+// ------------------------------------------------------------
+app.get("/api/scanner/nse/quote", async (req, res) => {
+    try {
+        const symbol = String(
+            req.query.symbol || ""
+        )
+            .trim()
+            .toUpperCase();
+
+        const timeframe = String(
+            req.query.timeframe || "5m"
+        )
+            .trim()
+            .toLowerCase();
+
+        if (!symbol) {
+            return res.status(400).json({
+                success: false,
+                message: "Symbol is required"
+            });
+        }
+
+        const stats =
+            await getNseLiveResultStats(
+                symbol,
+                timeframe
+            );
+
+        return res.json({
+            success: true,
+            source: "NSE",
+            symbol,
+            price: stats.price,
+            previousClose: stats.previousClose,
+            change: stats.dailyChange,
+            volume: stats.dailyVolume
+        });
+
+    } catch (error) {
+
+        console.error(
+            `NSE quote route error for ${req.query.symbol || "unknown"}:`,
+            error.message
+        );
+
+        return res.status(500).json({
+            success: false,
+            source: "NSE",
+            message: error.message
+        });
+    }
+});
+
+
+// ============================================================
+// MAGIC FILTER PARSE ROUTE
+// ============================================================
+app.post("/api/scanner/magic-filter", (req, res) => {
+    try {
+        const prompt = String(req.body?.prompt || "").trim();
+
+        if (!prompt) {
+            return res.status(400).json({
+                success: false,
+                message: "Prompt is required."
+            });
+        }
+
+        const parsed = parseMagicFilterPrompt(prompt);
+
+        if (!parsed.success) {
+            return res.status(422).json(parsed);
+        }
+
+        return res.json(parsed);
+    } catch (error) {
+        console.error("Magic Filter parse error:", error);
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+// ============================================================
+// NSE SCANNER BACKTEST
+// ============================================================
+// This is intentionally bounded. A historical intraday backtest
+// across the entire NSE universe would create thousands of NSE
+// requests. We therefore use the current NSE priority ordering and
+// backtest the top N stocks. The user can change maxStocks in the UI.
+// ============================================================
+
+app.post("/api/scanner/nse/backtest", async (req, res) => {
+    const startedAt = Date.now();
+
+    try {
+        const conditions = Array.isArray(req.body?.conditions)
+            ? req.body.conditions
+            : [];
+        const timeframe = String(req.body?.timeframe || "5m").toLowerCase();
+        const maxStocks = Math.min(
+            Math.max(Number(req.body?.maxStocks || 30), 1),
+            100
+        );
+        const lookbackDays = Math.min(
+            Math.max(Number(req.body?.days || 30), 1),
+            90
+        );
+
+        const allowedTimeframes = ["1m", "3m", "5m", "15m", "30m", "1h", "1d"];
+
+        if (!allowedTimeframes.includes(timeframe)) {
+            return res.status(400).json({
+                success: false,
+                message: `Unsupported timeframe: ${timeframe}`
+            });
+        }
+
+        if (!conditions.length) {
+            return res.status(400).json({
+                success: false,
+                message: "At least one condition is required."
+            });
+        }
+
+        const priorityStocks = await getNsePriorityStocks();
+        const symbols = priorityStocks
+            .slice(0, maxStocks)
+            .map(item => String(item.symbol).toUpperCase());
+
+        const signals = [];
+        const errors = [];
+        let completedStocks = 0;
+        let cursor = 0;
+
+        const WORKERS = 3;
+
+        async function worker() {
+            while (true) {
+                const index = cursor++;
+                if (index >= symbols.length) return;
+
+                const symbol = symbols[index];
+
+                try {
+                    const candles = await getNseCandles(symbol, timeframe);
+                    if (!candles.length) {
+                        completedStocks++;
+                        continue;
+                    }
+
+                    const dailyChangeMap = buildDailyChangeMap(candles);
+                    const cutoff = Date.now() - lookbackDays * 24 * 60 * 60 * 1000;
+                    const matchedDays = new Set();
+
+                    // Start far enough into the series for EMA/SMA lookback.
+                    const startIndex = Math.min(100, Math.max(20, candles.length - 1));
+
+                    for (let i = startIndex; i < candles.length; i++) {
+                        const candleTime = new Date(candles[i].time).getTime();
+                        if (!Number.isFinite(candleTime) || candleTime < cutoff) continue;
+
+                        const passed = conditions.every(condition =>
+                            checkServerCondition(
+                                condition,
+                                candles,
+                                dailyChangeMap,
+                                i
+                            )
+                        );
+
+                        if (!passed) continue;
+
+                        const day = serverDateKey(candles[i].time);
+                        if (!day || matchedDays.has(day)) continue;
+                        matchedDays.add(day);
+
+                        const dailyChange = Number(dailyChangeMap.get(day));
+
+                        signals.push({
+                            symbol,
+                            date: day,
+                            time: candles[i].time,
+                            price: Number(candles[i].close),
+                            change: Number.isFinite(dailyChange) ? dailyChange : null,
+                            volume: Number(candles[i].volume),
+                            timeframe
+                        });
+                    }
+
+                    completedStocks++;
+                } catch (error) {
+                    errors.push({
+                        symbol,
+                        message: error.message
+                    });
+                    completedStocks++;
+                }
+            }
+        }
+
+        await Promise.all(
+            Array.from(
+                { length: Math.min(WORKERS, symbols.length) },
+                () => worker()
+            )
+        );
+
+        signals.sort((a, b) => {
+            const changeA = Number.isFinite(a.change) ? a.change : -Infinity;
+            const changeB = Number.isFinite(b.change) ? b.change : -Infinity;
+            if (changeB !== changeA) return changeB - changeA;
+            return new Date(b.time).getTime() - new Date(a.time).getTime();
+        });
+
+        return res.json({
+            success: true,
+            source: "NSE",
+            timeframe,
+            days: lookbackDays,
+            stocksRequested: symbols.length,
+            stocksCompleted: completedStocks,
+            signalCount: signals.length,
+            signals: signals.slice(0, 500),
+            errors: errors.slice(0, 50),
+            elapsedMs: Date.now() - startedAt
+        });
+    } catch (error) {
+        console.error("NSE backtest error:", error);
+        return res.status(500).json({
+            success: false,
+            source: "NSE",
+            message: error.message,
+            elapsedMs: Date.now() - startedAt
+        });
+    }
+});
+
+// ============================================================
+// SCANNER ALERTS
+// ============================================================
+// The alert configuration is kept server-side while the backend
+// is running. The endpoint is intentionally configuration-only for
+// now; it does not silently place trades or execute orders.
+// ============================================================
+
+const NSE_SCANNER_ALERTS = new Map();
+
+app.get("/api/scanner/alerts", (req, res) => {
+    return res.json({
+        success: true,
+        alerts: [...NSE_SCANNER_ALERTS.values()]
+    });
+});
+
+app.post("/api/scanner/alerts", (req, res) => {
+    try {
+        const name = String(req.body?.name || "My NSE Scan Alert").trim();
+        const conditions = Array.isArray(req.body?.conditions)
+            ? req.body.conditions
+            : [];
+        const timeframe = String(req.body?.timeframe || "5m").toLowerCase();
+
+        if (!conditions.length) {
+            return res.status(400).json({
+                success: false,
+                message: "At least one condition is required."
+            });
+        }
+
+        const id = `alert_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const alertConfig = {
+            id,
+            name,
+            source: "NSE",
+            timeframe,
+            conditions,
+            enabled: true,
+            createdAt: new Date().toISOString()
+        };
+
+        NSE_SCANNER_ALERTS.set(id, alertConfig);
+
+        return res.json({
+            success: true,
+            alert: alertConfig
+        });
+    } catch (error) {
+        console.error("Create scanner alert error:", error);
+        return res.status(500).json({
+            success: false,
+            message: error.message
+        });
+    }
+});
+
+app.delete("/api/scanner/alerts/:id", (req, res) => {
+    const deleted = NSE_SCANNER_ALERTS.delete(String(req.params.id));
+    return res.json({
+        success: deleted,
+        message: deleted ? "Alert deleted." : "Alert not found."
+    });
+});
+
+// ------------------------------------------------------------
+// NSE SCANNER PRIORITY ROUTE
+// ------------------------------------------------------------
+//
+// Returns NSE stocks ordered by their latest % change.
+//
+// Frontend uses this ONLY to decide which stocks should be
+// scanned first.
+//
+// It does NOT apply scanner conditions.
+// ------------------------------------------------------------
+
+app.get(
+    "/api/scanner/nse/priority",
+    async (req, res) => {
+
+        try {
+
+            const priorityStocks =
+                await getNsePriorityStocks();
+
+
+            return res.json({
+
+                success: true,
+
+                source: "NSE",
+
+                count:
+                    priorityStocks.length,
+
+                stocks:
+                    priorityStocks
+
+            });
+
+        }
+
+        catch (error) {
+
+            console.error(
+                "NSE priority route error:",
+                error.message
+            );
+
+
+            return res.status(500).json({
+
+                success: false,
+
+                source: "NSE",
+
+                message:
+                    error.message,
+
+                stocks: []
+
+            });
+
+        }
+
+    }
+);
+// ------------------------------------------------------------
+// NSE STOCK UNIVERSE ROUTE
+// ------------------------------------------------------------
+app.get("/api/scanner/nse/stocks", async (req, res) => {
+    try {
+        const stocks = await getNseStocks();
+
+        return res.json({
+            success: true,
+            source: "NSE",
+            count: stocks.length,
+            stocks,
+        });
+
+    } catch (error) {
+        console.error(
+            "NSE stock universe error:",
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            source: "NSE",
+            message: error.message,
+        });
+    }
+});
+/* =========================================================
+   START SERVER
+========================================================= */
+
+const PORT =
+    process.env.PORT ||
+    3000;
+
+
+async function startServer() {
+
+    try {
+
+        /*
+           Login first.
+
+           Instrument master and
+           WebSocket are initialized
+           before the server starts.
+        */
+
+        await loginToAngelOne();
+
+
+        app.listen(
+
+            PORT,
+
+            "0.0.0.0",
+
+            () => {
+
+                console.log(
+                    `🚀 EMA360 backend running on port ${PORT}`
+                );
+
+                console.log(
+                    `🌐 Local API: http://localhost:${PORT}`
+                );
+
+                console.log(
+                    `📡 Stream: http://localhost:${PORT}/api/stream`
+                );
+
+            }
+
+        );
+
+    }
+
+
+    catch (error) {
+
+        console.error(
+            "❌ Failed to start EMA360 backend:",
+            error
+        );
+
+    }
+}
+
+
+startServer();
