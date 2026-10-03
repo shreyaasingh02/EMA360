@@ -38,11 +38,15 @@ export async function getHistoricalCandles(
         `&timeframe=${encodeURIComponent(timeframe)}`;
 
     const response = await fetch(
-        url,
-        {
-            credentials: "include"
+    url,
+    {
+        method: "GET",
+        credentials: "include",
+        headers: {
+            "Accept": "application/json"
         }
-    );
+    }
+);
 
     if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
