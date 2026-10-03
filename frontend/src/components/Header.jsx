@@ -30,11 +30,8 @@ function Header({
     let cancelled = false;
 
     const getApiBase = () => {
-      if (typeof window === "undefined") return "http://localhost:3000";
-      return window.location.hostname === "localhost"
-        ? "http://localhost:3000"
-        : "";
-    };
+    return import.meta.env.VITE_API_URL || "http://localhost:3000";
+};
 
     const loadNseHeader = async () => {
       const base = getApiBase();
