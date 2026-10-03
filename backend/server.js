@@ -137,15 +137,38 @@ function getAuthenticatedSession(req) {
     const cookies = parseCookies(req.headers.cookie || "");
     const sessionId = cookies.ema360_session;
 
-    if (!sessionId) return null;
+    console.log("🔐 AUTH DEBUG:", {
+        path: req.path,
+        hasCookie: Boolean(sessionId),
+        cookieLength: sessionId ? sessionId.length : 0,
+        sessionExists: sessionId
+            ? authSessions.has(sessionId)
+            : false,
+        activeSessions: authSessions.size,
+        cfRay: req.headers["cf-ray"] || null
+    });
+
+    if (!sessionId) {
+        console.log("❌ AUTH DEBUG: NO SESSION COOKIE");
+        return null;
+    }
 
     const session = authSessions.get(sessionId);
-    if (!session) return null;
+
+    if (!session) {
+        console.log("❌ AUTH DEBUG: COOKIE EXISTS BUT SESSION NOT FOUND");
+        return null;
+    }
 
     if (Date.now() > session.expiresAt) {
+        console.log("❌ AUTH DEBUG: SESSION EXPIRED");
         authSessions.delete(sessionId);
         return null;
     }
+
+    console.log(
+        `✅ AUTH DEBUG: SESSION VALID FOR ${session.user?.clientId || "unknown"}`
+    );
 
     return { sessionId, session };
 }
