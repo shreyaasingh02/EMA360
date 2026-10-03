@@ -107,12 +107,14 @@ function parseCookies(header = "") {
 }
 
 function cookieFlags(maxAgeSeconds) {
-    const secure =
-        process.env.NODE_ENV === "production"
-            ? "; Secure"
-            : "";
+    const isProduction =
+        process.env.NODE_ENV === "production";
 
-    return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`;
+    if (isProduction) {
+        return `Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${maxAgeSeconds}`;
+    }
+
+    return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
 }
 
 function setAuthCookie(res, sessionId) {
