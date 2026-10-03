@@ -1,19 +1,4 @@
-import {
-
-
-
-    useEffect,
-
-
-
-    useState
-
-
-
-} from "react";
-
-
-
+import { useEffect, useState } from "react";
 
 import Header from "./components/Header";
 import Scanner from "./components/Scanner";
@@ -147,7 +132,7 @@ function MarketApp({ session, onLogout }) {
 
 
 
-    } = useMarketData(session?.dataSource || "angel");
+    } = useMarketData(session?.dataSource || "nse");
 
 
 
@@ -1317,34 +1302,190 @@ function MarketApp({ session, onLogout }) {
 
 }
 
-
-
 function App() {
-    const [session, setSession] = useState(() => {
-        try {
-            const saved = localStorage.getItem("ema360_session");
-            return saved ? JSON.parse(saved) : null;
-        } catch (error) {
-            console.error("Failed to restore EMA360 session:", error);
-            return null;
+
+    const API_URL =
+        import.meta.env.VITE_API_URL ||
+        "http://localhost:3000";
+
+
+    const [session, setSession] =
+        useState(null);
+
+
+    const [checkingAuth, setCheckingAuth] =
+        useState(true);
+
+
+    useEffect(() => {
+
+        async function checkAuthentication() {
+
+            try {
+
+                const response =
+                    await fetch(
+                        `${API_URL}/api/auth/me`,
+                        {
+                            credentials: "include"
+                        }
+                    );
+
+
+                if (!response.ok) {
+
+                    setSession(null);
+
+                    return;
+
+                }
+
+
+                const data =
+                    await response.json();
+
+
+                if (
+                    data.authenticated &&
+                    data.user
+                ) {
+
+                    setSession({
+
+                        mode:
+                            data.user.dataSource === "nse"
+                                ? "guest"
+                                : "broker",
+
+                        userType:
+                            data.user.dataSource === "nse"
+                                ? "guest"
+                                : "login",
+
+                        email:
+                            data.user.email,
+
+                        brokerId:
+                            data.user.clientId,
+
+                        dataSource:
+                            data.user.dataSource
+
+                    });
+
+                }
+
+                else {
+
+                    setSession(null);
+
+                }
+
+            }
+
+            catch (error) {
+
+                console.error(
+                    "Authentication check failed:",
+                    error
+                );
+
+                setSession(null);
+
+            }
+
+            finally {
+
+                setCheckingAuth(false);
+
+            }
+
         }
-    });
+
+
+        checkAuthentication();
+
+    }, [API_URL]);
+
+
+    async function handleLogout() {
+
+        try {
+
+            await fetch(
+                `${API_URL}/api/auth/logout`,
+                {
+                    method: "POST",
+                    credentials: "include"
+                }
+            );
+
+        }
+
+        catch (error) {
+
+            console.error(
+                "Logout error:",
+                error
+            );
+
+        }
+
+
+        setSession(null);
+
+    }
+
+
+    if (checkingAuth) {
+
+        return (
+
+            <div
+                style={{
+                    minHeight: "100vh",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    background: "#07111f",
+                    color: "#18d6a5",
+                    fontFamily: "Arial, sans-serif",
+                    fontSize: "14px",
+                    fontWeight: "700"
+                }}
+            >
+                Connecting to EMA360...
+            </div>
+
+        );
+
+    }
+
 
     if (!session) {
-        return <Login onAuthenticated={setSession} />;
+
+        return (
+            <Login
+                onAuthenticated={
+                    setSession
+                }
+            />
+        );
+
     }
 
-    function handleLogout() {
-        localStorage.removeItem("ema360_session");
-        setSession(null);
-    }
 
     return (
+
         <MarketApp
             session={session}
-            onLogout={handleLogout}
+            onLogout={
+                handleLogout
+            }
         />
+
     );
+
 }
 
 export default App;

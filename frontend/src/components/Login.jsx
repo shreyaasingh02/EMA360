@@ -1,222 +1,124 @@
-import { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 // import "./Login.css";
 
-function Login({ onAuthenticated }) {
-    const [mode, setMode] = useState("login");
-    const [form, setForm] = useState({
-        name: "",
-        email: "",
-        password: "",
-        confirmPassword: "",
-        brokerId: ""
-    });
+const API_URL = (import.meta.env.VITE_API_URL || "http://localhost:3000").replace(/\/$/, "");
+
+function saveFrontendSession(data) {
+    const session = {
+        mode: "broker",
+        userType: "broker",
+        email: data?.user?.email || null,
+        brokerId: data?.user?.clientId || null,
+        dataSource: "angel",
+        brokerConnected: true
+    };
+    localStorage.setItem("ema360_session", JSON.stringify(session));
+    return session;
+}
+
+function saveGuestSession(onAuthenticated) {
+    const session = { mode: "guest", userType: "guest", email: null, brokerId: null, dataSource: "nse", brokerConnected: false };
+    localStorage.setItem("ema360_session", JSON.stringify(session));
+    onAuthenticated?.(session);
+}
+
+export default function Login({ onAuthenticated }) {
+    const [clientId, setClientId] = useState("");
+    const [pin, setPin] = useState("");
+    const [totp, setTotp] = useState("");
+    const [showPin, setShowPin] = useState(false);
+    const [loading, setLoading] = useState(false);
+    const [checkingSession, setCheckingSession] = useState(true);
     const [error, setError] = useState("");
+    const authenticatedRef = useRef(false);
 
-    function updateField(event) {
-        const { name, value } = event.target;
-        setForm(previous => ({
-            ...previous,
-            [name]: value
-        }));
-        setError("");
-    }
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const response = await fetch(`${API_URL}/api/auth/me`, { credentials: "include", headers: { Accept: "application/json" } });
+                const data = await response.json().catch(() => ({}));
+                if (response.ok && data.success && !cancelled && !authenticatedRef.current) {
+                    authenticatedRef.current = true;
+                    onAuthenticated?.(saveFrontendSession(data));
+                }
+            } catch (err) {
+                console.error("EMA360 session check failed:", err);
+            } finally {
+                if (!cancelled) setCheckingSession(false);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [onAuthenticated]);
 
-    function handleSubmit(event) {
+    async function connectWithAngelOne(event) {
         event.preventDefault();
         setError("");
+        const cleanClientId = clientId.trim();
+        const cleanPin = pin.trim();
+        const cleanTotp = totp.trim();
 
-        if (!form.email.trim() || !form.password.trim()) {
-            setError("Please enter your email and password.");
+        if (!cleanClientId || !cleanPin || !cleanTotp) {
+            setError("Enter your Angel One Client ID, PIN and current TOTP.");
+            return;
+        }
+        if (!/^\d{6}$/.test(cleanTotp)) {
+            setError("TOTP must be the current 6-digit TOTP.");
             return;
         }
 
-        if (mode === "signup") {
-            if (!form.name.trim()) {
-                setError("Please enter your name.");
-                return;
-            }
-
-            if (form.password !== form.confirmPassword) {
-                setError("Passwords do not match.");
-                return;
-            }
+        setLoading(true);
+        try {
+            const response = await fetch(`${API_URL}/api/auth/angel/login`, {
+                method: "POST",
+                credentials: "include",
+                headers: { "Content-Type": "application/json", Accept: "application/json" },
+                body: JSON.stringify({ clientId: cleanClientId, pin: cleanPin, totp: cleanTotp })
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok || !data.success) throw new Error(data.message || "Angel One authentication failed.");
+            authenticatedRef.current = true;
+            onAuthenticated?.(saveFrontendSession(data));
+        } catch (err) {
+            console.error("Angel One login failed:", err);
+            setError(err.message || "Could not connect to Angel One.");
+        } finally {
+            setLoading(false);
         }
-
-        if (!form.brokerId.trim()) {
-            setError("Broker ID / Client Code is required for broker login. Use Guest if you do not have one.");
-            return;
-        }
-
-        // Temporary frontend session. Real account and Angel One
-        // authentication will be connected to the backend next.
-        const session = {
-            mode: "broker",
-            userType: mode,
-            email: form.email.trim(),
-            brokerId: form.brokerId.trim(),
-            dataSource: "angel"
-        };
-
-        localStorage.setItem(
-            "ema360_session",
-            JSON.stringify(session)
-        );
-
-        onAuthenticated(session);
     }
 
-    function continueAsGuest() {
-        const session = {
-            mode: "guest",
-            userType: "guest",
-            email: null,
-            brokerId: null,
-            dataSource: "nse"
-        };
-
-        localStorage.setItem(
-            "ema360_session",
-            JSON.stringify(session)
-        );
-
-        onAuthenticated(session);
+    if (checkingSession) {
+        return <div className="login-page login-loading-page"><div className="login-loading-card"><div className="loading-spinner" /><h2>Checking your session</h2><p>Verifying EMA360 securely...</p></div></div>;
     }
 
     return (
-        <div className="authPage">
-            <div className="authGlow authGlowOne" />
-            <div className="authGlow authGlowTwo" />
+        <main className="login-page">
+            <div className="login-glow login-glow-one" /><div className="login-glow login-glow-two" />
+            <section className="login-card" aria-label="EMA360 login">
+                <header className="login-header">
+                    <div className="login-brand-mark"><span>EMA</span><span>360</span></div>
+                    <h1>Welcome to EMA360</h1>
+                    <p>Connect your Angel One account or continue with NSE guest mode.</p>
+                </header>
 
-            <section className="authCard">
-                <div className="authBrand">
-                    <div className="authLogo">E</div>
-                    <div>
-                        <div className="authBrandName">EMA360</div>
-                        <div className="authBrandSub">MARKET INTELLIGENCE</div>
-                    </div>
-                </div>
+                <form className="connection-card" onSubmit={connectWithAngelOne}>
+                    <div className="connection-icon">↗</div>
+                    <div className="connection-content"><h2>Connect Angel One</h2><p>Use your own Angel One Client ID, PIN and current TOTP. These are sent to Angel One for authentication and are not stored in EMA360.</p></div>
 
-                <div className="authHeading">
-                    <h1>{mode === "login" ? "Welcome back" : "Create your account"}</h1>
-                    <p>
-                        {mode === "login"
-                            ? "Login to connect your broker and access EMA360."
-                            : "Create your EMA360 account and connect your broker."}
-                    </p>
-                </div>
+                    <label className="login-field"><span>Angel One Client ID</span><input value={clientId} onChange={e => setClientId(e.target.value)} placeholder="Client ID" autoComplete="username" disabled={loading} /></label>
+                    <label className="login-field"><span>Angel One PIN</span><div className="password-wrap"><input type={showPin ? "text" : "password"} value={pin} onChange={e => setPin(e.target.value)} placeholder="PIN" autoComplete="current-password" disabled={loading} /><button type="button" className="password-toggle" onClick={() => setShowPin(v => !v)}>{showPin ? "Hide" : "Show"}</button></div></label>
+                    <label className="login-field"><span>Current TOTP</span><input value={totp} onChange={e => setTotp(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="6-digit TOTP" inputMode="numeric" maxLength={6} autoComplete="one-time-code" disabled={loading} /></label>
 
-                <div className="authTabs">
-                    <button
-                        type="button"
-                        className={mode === "login" ? "authTab active" : "authTab"}
-                        onClick={() => {
-                            setMode("login");
-                            setError("");
-                        }}
-                    >
-                        Login
-                    </button>
-                    <button
-                        type="button"
-                        className={mode === "signup" ? "authTab active" : "authTab"}
-                        onClick={() => {
-                            setMode("signup");
-                            setError("");
-                        }}
-                    >
-                        Sign Up
-                    </button>
-                </div>
-
-                <form className="authForm" onSubmit={handleSubmit}>
-                    {mode === "signup" && (
-                        <label className="authField">
-                            <span>Full Name</span>
-                            <input
-                                name="name"
-                                value={form.name}
-                                onChange={updateField}
-                                placeholder="Enter your name"
-                                autoComplete="name"
-                            />
-                        </label>
-                    )}
-
-                    <label className="authField">
-                        <span>Email</span>
-                        <input
-                            type="email"
-                            name="email"
-                            value={form.email}
-                            onChange={updateField}
-                            placeholder="you@example.com"
-                            autoComplete="email"
-                        />
-                    </label>
-
-                    <label className="authField">
-                        <span>Password</span>
-                        <input
-                            type="password"
-                            name="password"
-                            value={form.password}
-                            onChange={updateField}
-                            placeholder="Enter your password"
-                            autoComplete={mode === "login" ? "current-password" : "new-password"}
-                        />
-                    </label>
-
-                    {mode === "signup" && (
-                        <label className="authField">
-                            <span>Confirm Password</span>
-                            <input
-                                type="password"
-                                name="confirmPassword"
-                                value={form.confirmPassword}
-                                onChange={updateField}
-                                placeholder="Confirm your password"
-                                autoComplete="new-password"
-                            />
-                        </label>
-                    )}
-
-                    <label className="authField">
-                        <span>Broker ID / Client Code</span>
-                        <input
-                            name="brokerId"
-                            value={form.brokerId}
-                            onChange={updateField}
-                            placeholder="Enter your broker ID"
-                            autoComplete="off"
-                        />
-                    </label>
-
-                    {error && <div className="authError">{error}</div>}
-
-                    <button className="authPrimaryButton" type="submit">
-                        {mode === "login" ? "Login & Connect Broker" : "Create Account & Connect Broker"}
-                    </button>
+                    <button type="submit" className="angel-button" disabled={loading}><span className="angel-button-icon">A</span><span>{loading ? "Connecting..." : "Connect with Angel One"}</span>{!loading && <span className="button-arrow">→</span>}</button>
                 </form>
 
-                <div className="authDivider">
-                    <span>OR</span>
-                </div>
+                {error && <div className="login-error" role="alert"><span className="error-icon">!</span><div><strong>Connection failed</strong><p>{error}</p></div></div>}
 
-                <button
-                    type="button"
-                    className="guestButton"
-                    onClick={continueAsGuest}
-                >
-                    <span>Continue as Guest</span>
-                    <small>No Broker ID? Use NSE market data</small>
-                </button>
-
-                <p className="authNote">
-                    Your broker credentials will be handled through the secure backend connection.
-                </p>
+                <div className="login-divider"><span /><b>OR</b><span /></div>
+                <button type="button" className="guest-button" onClick={() => saveGuestSession(onAuthenticated)} disabled={loading}><span className="guest-icon">◉</span>Continue as Guest<span className="guest-arrow">→</span></button>
+                <div className="login-note"><span className="shield-icon">✓</span><p><strong>Guest mode</strong> uses NSE market data. Connected mode uses the authenticated Angel One account.</p></div>
+                <footer className="login-footer"><span>EMA360</span><span>•</span><span>Market Intelligence</span></footer>
             </section>
-        </div>
+        </main>
     );
 }
-
-export default Login;

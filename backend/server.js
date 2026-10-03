@@ -1,4 +1,8 @@
 require("dotenv").config();
+
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const axios = require("axios");
 
 const { NseIndia } = require("stock-nse-india");
@@ -22,22 +26,370 @@ const NSE_PRIORITY_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const express = require("express");
 const { SmartAPI, WebSocketV2 } = require("smartapi-javascript");
-const { generate } = require("otplib");
 
 const app = express();
 
 const cors = require("cors");
 
+const FRONTEND_URL =
+    process.env.FRONTEND_URL ||
+    "http://localhost:5173";
+
 app.use(
     cors({
-        origin: "http://localhost:5173"
+        origin: FRONTEND_URL,
+        credentials: true
     })
 );
 
 // Scanner Magic Filters / Backtest / Alerts send JSON bodies.
 app.use(express.json({ limit: "1mb" }));
 
-const clients = new Set();
+/* =========================================================
+   EMA360 + ANGEL ONE OAUTH / PUBLISHER LOGIN
+   ---------------------------------------------------------
+   Flow:
+
+   1. User clicks "Connect with Broker Account" in React.
+   2. React sends the browser to /api/auth/angel/start.
+   3. Backend redirects to Angel One's official login page.
+   4. User logs in on Angel One. EMA360 never receives the PIN/TOTP.
+   5. Angel One redirects to /api/auth/angel/callback.
+   6. Backend validates the OAuth state, stores the broker tokens
+      server-side in the current session, sets an HttpOnly cookie,
+      and redirects back to EMA360.
+   7. React calls /api/auth/me and opens the dashboard.
+
+   IMPORTANT:
+   - Configure the exact callback URL in the Angel One API app.
+   - New Login authentication is handled by the documented login API.
+     The old Publisher redirect flow is not used by this server. Current Angel One API-app rules can vary by app type.
+   - Sessions are kept in memory in this version. A persistent store
+     should be used before deploying multiple backend instances.
+========================================================= */
+
+const SESSION_COOKIE = "ema360_session";
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/*
+ * Each EMA360 browser session owns its own Angel One SmartAPI session.
+ * There is intentionally NO fixed client code, PIN or TOTP secret in .env.
+ */
+const authSessions = new Map();
+
+function timingSafeEqualText(a, b) {
+    const aa = Buffer.from(String(a));
+    const bb = Buffer.from(String(b));
+
+    if (aa.length !== bb.length) return false;
+    return crypto.timingSafeEqual(aa, bb);
+}
+
+function parseCookies(header = "") {
+    const cookies = {};
+
+    for (const part of String(header).split(";")) {
+        const index = part.indexOf("=");
+        if (index === -1) continue;
+
+        const key = part.slice(0, index).trim();
+        const value = part.slice(index + 1).trim();
+        if (!key) continue;
+
+        try {
+            cookies[key] = decodeURIComponent(value);
+        } catch {
+            cookies[key] = value;
+        }
+    }
+
+    return cookies;
+}
+
+function cookieFlags(maxAgeSeconds) {
+    const secure =
+        process.env.NODE_ENV === "production"
+            ? "; Secure"
+            : "";
+
+    return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure}`;
+}
+
+function setAuthCookie(res, sessionId) {
+    res.setHeader(
+        "Set-Cookie",
+        `ema360_session=${encodeURIComponent(sessionId)}; ${cookieFlags(
+            Math.floor(SESSION_TTL_MS / 1000)
+        )}`
+    );
+}
+
+function clearAuthCookie(res) {
+    res.setHeader(
+        "Set-Cookie",
+        `ema360_session=; ${cookieFlags(0)}`
+    );
+}
+
+function getAuthenticatedSession(req) {
+    const cookies = parseCookies(req.headers.cookie || "");
+    const sessionId = cookies.ema360_session;
+
+    if (!sessionId) return null;
+
+    const session = authSessions.get(sessionId);
+    if (!session) return null;
+
+    if (Date.now() > session.expiresAt) {
+        authSessions.delete(sessionId);
+        return null;
+    }
+
+    return { sessionId, session };
+}
+
+function publicUser(user) {
+    if (!user) return null;
+
+    return {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        clientId: user.clientId,
+        broker: "angelone"
+    };
+}
+
+/* =========================================================
+   ANGEL ONE — CURRENT NEW LOGIN FLOW
+
+   Angel's current SmartAPI documentation uses the
+   loginByPassword endpoint for the New Login/API flow.
+   The user supplies THEIR Client ID, PIN and current TOTP.
+
+   IMPORTANT:
+   - ANGEL_CLIENT_CODE is NOT read from .env.
+   - ANGEL_PIN is NOT read from .env.
+   - ANGEL_TOTP_SECRET is NOT read from .env.
+   - JWT/feed/refresh tokens stay server-side.
+========================================================= */
+
+app.post("/api/auth/angel/login", async (req, res) => {
+    try {
+        const clientId = String(req.body?.clientId || "").trim();
+        const pin = String(req.body?.pin || "").trim();
+        const totp = String(req.body?.totp || "").trim();
+
+        if (!clientId || !pin || !totp) {
+            return res.status(400).json({
+                success: false,
+                message: "Angel One Client ID, PIN and TOTP are required."
+            });
+        }
+
+        const apiKey = String(process.env.ANGEL_API_KEY || "").trim();
+
+        if (!apiKey) {
+            return res.status(500).json({
+                success: false,
+                message: "ANGEL_API_KEY is not configured on the backend."
+            });
+        }
+
+        console.log(`🔐 Angel One login attempt for client ${clientId}`);
+
+        const loginResponse = await axios.post(
+            "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
+            {
+                clientcode: clientId,
+                password: pin,
+                totp
+            },
+            {
+                headers: {
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                    "X-PrivateKey": apiKey,
+                    "X-UserType": "USER",
+                    "X-SourceID": "WEB",
+                    "X-MACAddress": "00:00:00:00:00:00"
+                },
+                timeout: 15000
+            }
+        );
+
+        const login = loginResponse.data;
+
+        if (!login?.status || !login?.data?.jwtToken) {
+            console.error("❌ Angel One login rejected:", login);
+
+            return res.status(401).json({
+                success: false,
+                message:
+                    login?.message ||
+                    "Angel One authentication failed."
+            });
+        }
+
+        const jwtToken = login.data.jwtToken;
+        const refreshToken = login.data.refreshToken || null;
+        const feedToken = login.data.feedToken || null;
+
+        const profileResponse = await axios.get(
+            "https://apiconnect.angelone.in/rest/secure/angelbroking/user/v1/getProfile",
+            {
+                headers: {
+                    Authorization: `Bearer ${jwtToken}`,
+                    "X-PrivateKey": apiKey,
+                    "X-UserType": "USER",
+                    "X-SourceID": "WEB",
+                    "X-MACAddress": "00:00:00:00:00:00",
+                    Accept: "application/json"
+                },
+                timeout: 15000
+            }
+        );
+
+        const profile = profileResponse.data?.data || {};
+        const connectedClientId = String(
+            profile.clientcode || clientId
+        ).trim();
+
+        const user = {
+            id: crypto.randomUUID(),
+            name: String(profile.name || connectedClientId),
+            email: profile.email || null,
+            clientId: connectedClientId,
+            broker: "angelone"
+        };
+
+        const sessionId = crypto.randomBytes(32).toString("hex");
+
+        authSessions.set(sessionId, {
+            user,
+            jwtToken,
+            refreshToken,
+            feedToken,
+            createdAt: Date.now(),
+            expiresAt: Date.now() + SESSION_TTL_MS
+        });
+
+        // Start this user's Angel One live feed.
+        await startAngelWebSocket(sessionId, authSessions.get(sessionId));
+
+        setAuthCookie(res, sessionId);
+
+        console.log(
+            `✅ Angel One login successful for ${connectedClientId}`
+        );
+
+        return res.json({
+            success: true,
+            user: publicUser(user),
+            dataSource: "angel",
+            brokerConnected: true
+        });
+    } catch (error) {
+        console.error(
+            "❌ Angel One user login failed:",
+            error?.response?.data || error?.message || error
+        );
+
+        return res.status(401).json({
+            success: false,
+            message:
+                error?.response?.data?.message ||
+                "Angel One authentication failed. Check your Client ID, PIN and TOTP."
+        });
+    }
+});
+
+/* =========================================================
+   CURRENT EMA360 SESSION
+========================================================= */
+
+app.get("/api/auth/me", (req, res) => {
+    const authenticated = getAuthenticatedSession(req);
+
+    if (!authenticated) {
+        return res.status(401).json({
+            success: false,
+            message: "Not authenticated."
+        });
+    }
+
+    return res.json({
+        success: true,
+        user: publicUser(authenticated.session.user),
+        dataSource: "angel",
+        brokerConnected: true
+    });
+});
+
+/* =========================================================
+   LOGOUT
+========================================================= */
+
+app.post("/api/auth/logout", async (req, res) => {
+    const authenticated = getAuthenticatedSession(req);
+
+    if (authenticated) {
+        const { sessionId, session } = authenticated;
+
+        try {
+            if (session.jwtToken && session.user?.clientId) {
+                await axios.post(
+                    "https://apiconnect.angelone.in/rest/secure/angelbroking/user/v1/logout",
+                    { clientcode: session.user.clientId },
+                    {
+                        headers: {
+                            Authorization: `Bearer ${session.jwtToken}`,
+                            "X-PrivateKey": process.env.ANGEL_API_KEY,
+                            "X-UserType": "USER",
+                            "X-SourceID": "WEB",
+                            "X-MACAddress": "00:00:00:00:00:00",
+                            "Content-Type": "application/json",
+                            Accept: "application/json"
+                        },
+                        timeout: 10000
+                    }
+                );
+            }
+        } catch (error) {
+            console.warn(
+                "⚠️ Angel One logout request failed:",
+                error?.response?.data?.message || error?.message
+            );
+        }
+
+        stopAngelWebSocket(sessionId);
+        authSessions.delete(sessionId);
+    }
+
+    clearAuthCookie(res);
+
+    return res.json({
+        success: true,
+        message: "Logged out successfully."
+    });
+});
+
+setInterval(() => {
+    const now = Date.now();
+
+    for (const [sessionId, session] of authSessions.entries()) {
+        if (now > session.expiresAt) {
+            stopAngelWebSocket(sessionId);
+            authSessions.delete(sessionId);
+        }
+    }
+}, 60 * 1000).unref();
+
+const clients = new Map();
+
+// Live Angel One state is kept per authenticated EMA360 session.
+const angelWebSockets = new Map();
+const latestTicksBySession = new Map();
 
 let latestTicks = {};
 let instrumentMaster = [];
@@ -122,9 +474,9 @@ function historicalCacheKey(
    ANGEL ONE
 ========================================================= */
 
-const smartApi = new SmartAPI({
-    api_key: process.env.ANGEL_API_KEY
-});
+// No global Angel One account is configured here.
+// Each authenticated user gets their own SmartAPI instance.
+
 
 
 /* =========================================================
@@ -425,13 +777,127 @@ function convertCandles(data) {
 
 
 /* =========================================================
+   ANGEL ONE LIVE WEBSOCKET — PER USER SESSION
+========================================================= */
+
+async function startAngelWebSocket(sessionId, session) {
+    if (!session?.jwtToken || !session?.feedToken || !session?.user?.clientId) {
+        console.warn("⚠️ Cannot start Angel One WebSocket: incomplete session tokens.");
+        return;
+    }
+
+    /* Close an older socket for the same EMA360 session, if any. */
+    const existing = angelWebSockets.get(sessionId);
+    if (existing) {
+        try { existing.close(); } catch (_) {}
+        angelWebSockets.delete(sessionId);
+    }
+
+    try {
+        if (!Object.keys(symbolTokens).length) {
+            await loadInstrumentMaster();
+        }
+
+        const ws = new WebSocketV2({
+            jwttoken: session.jwtToken,
+            apikey: process.env.ANGEL_API_KEY,
+            clientcode: session.user.clientId,
+            feedtype: session.feedToken
+        });
+
+        angelWebSockets.set(sessionId, ws);
+
+        await ws.connect();
+        console.log(`🟢 Angel One WebSocket connected for ${session.user.clientId}`);
+
+        const tokens = Object.values(symbolTokens)
+            .map(item => String(item.token))
+            .filter(Boolean);
+
+        if (!tokens.length) {
+            console.warn("⚠️ No Angel One instrument tokens available for WebSocket subscription.");
+            return;
+        }
+
+        ws.fetchData({
+            correlationID: `ema360-${sessionId.slice(0, 8)}`,
+            action: 1,
+            mode: 1,
+            exchangeType: 1,
+            tokens
+        });
+
+        console.log(`📡 Angel One WebSocket subscribed to ${tokens.length} instruments for ${session.user.clientId}`);
+
+        ws.on("tick", data => {
+            if (!data || typeof data !== "object") return;
+
+            const token = String(data.token ?? "").replace(/"/g, "");
+            if (!token) return;
+
+            const rawLtp = Number(data.last_traded_price);
+            const normalizedTick = {
+                ...data,
+                token,
+                ltp: Number.isFinite(rawLtp) ? rawLtp / 100 : null
+            };
+
+            let sessionTicks = latestTicksBySession.get(sessionId);
+            if (!sessionTicks) {
+                sessionTicks = {};
+                latestTicksBySession.set(sessionId, sessionTicks);
+            }
+            sessionTicks[token] = normalizedTick;
+
+            // Keep this for backwards-compatible diagnostics only.
+            latestTicks[token] = normalizedTick;
+
+            for (const [clientRes, clientSessionId] of clients.entries()) {
+                if (clientSessionId !== sessionId) continue;
+                try {
+                    clientRes.write(`data: ${JSON.stringify(normalizedTick)}\n\n`);
+                } catch (_) {}
+            }
+        });
+
+        ws.on("error", error => {
+            console.error(`❌ Angel One WebSocket error for ${session.user.clientId}:`, error?.message || error);
+        });
+
+        ws.on("close", () => {
+            if (angelWebSockets.get(sessionId) === ws) {
+                angelWebSockets.delete(sessionId);
+            }
+            console.log(`🔴 Angel One WebSocket closed for ${session.user.clientId}`);
+        });
+    } catch (error) {
+        angelWebSockets.delete(sessionId);
+        console.error(`❌ Could not start Angel One WebSocket for ${session.user.clientId}:`, error?.message || error);
+    }
+}
+
+function stopAngelWebSocket(sessionId) {
+    const ws = angelWebSockets.get(sessionId);
+    if (ws) {
+        try { ws.close(); } catch (_) {}
+        angelWebSockets.delete(sessionId);
+    }
+    latestTicksBySession.delete(sessionId);
+}
+
+/* =========================================================
    HISTORICAL DATA
 ========================================================= */
 
 async function getHistoricalCandles(
     stock,
-    timeframe
+    timeframe,
+    angelSession
 ) {
+
+    if (!angelSession?.jwtToken) {
+        throw new Error("Angel One account is not connected.");
+    }
 
     const instrument =
         symbolTokens[stock];
@@ -627,23 +1093,33 @@ async function getHistoricalCandles(
 
                     response =
                         await enqueueHistoricalRequest(
-                            () =>
-                                smartApi.getCandleData({
+                            async () => {
+                                const apiResponse =
+                                    await axios.post(
+                                        "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData",
+                                        {
+                                            exchange: instrument.exchange,
+                                            symboltoken: instrument.token,
+                                            interval: config.interval,
+                                            fromdate,
+                                            todate
+                                        },
+                                        {
+                                            headers: {
+                                                Authorization: `Bearer ${angelSession.jwtToken}`,
+                                                "X-PrivateKey": process.env.ANGEL_API_KEY,
+                                                "X-UserType": "USER",
+                                                "X-SourceID": "WEB",
+                                                "X-MACAddress": "00:00:00:00:00:00",
+                                                "Content-Type": "application/json",
+                                                Accept: "application/json"
+                                            },
+                                            timeout: 20000
+                                        }
+                                    );
 
-                                    exchange:
-                                        instrument.exchange,
-
-                                    symboltoken:
-                                        instrument.token,
-
-                                    interval:
-                                        config.interval,
-
-                                    fromdate,
-
-                                    todate
-
-                                })
+                                return apiResponse.data;
+                            }
                         );
 
 
@@ -1017,279 +1493,12 @@ function aggregateCalendarCandles(
 
 
 /* =========================================================
-   ANGEL ONE LOGIN
+   ANGEL ONE SERVER-WIDE LOGIN REMOVED
+   ---------------------------------------------------------
+   EMA360 no longer reads ANGEL_CLIENT_CODE, ANGEL_PIN or
+   ANGEL_TOTP_SECRET from .env. User-specific SmartAPI sessions
+   are created by /api/auth/angel/login above.
 ========================================================= */
-
-async function loginToAngelOne() {
-
-    try {
-
-        const totp =
-            await generate({
-
-                secret:
-                    process.env.ANGEL_TOTP_SECRET
-
-            });
-
-
-        console.log(
-            "Logging in to Angel One..."
-        );
-
-
-        const session =
-            await smartApi.generateSession(
-
-                process.env.ANGEL_CLIENT_CODE,
-
-                process.env.ANGEL_PIN,
-
-                totp
-
-            );
-
-
-        if (
-            !session.status
-        ) {
-
-            console.error(
-                "Angel One login failed:",
-                session
-            );
-
-            return;
-        }
-
-
-        console.log(
-            "✅ Angel One login successful!"
-        );
-
-
-        const feedToken =
-            session.data.feedToken;
-
-
-        console.log(
-            "✅ Feed token received"
-        );
-
-
-        /* =================================================
-           LOAD INSTRUMENT MASTER
-        ================================================= */
-
-        await loadInstrumentMaster();
-
-
-        /* =================================================
-           ANGEL ONE WEBSOCKET
-        ================================================= */
-
-        const ws =
-            new WebSocketV2({
-
-                jwttoken:
-                    session.data.jwtToken,
-
-                apikey:
-                    process.env.ANGEL_API_KEY,
-
-                clientcode:
-                    process.env.ANGEL_CLIENT_CODE,
-
-                feedtype:
-                    feedToken
-
-            });
-
-
-        await ws.connect();
-
-
-        console.log(
-            "🟢 Angel One WebSocket connected"
-        );
-
-
-        /*
-           Subscribe to all available
-           NIFTY 50 tokens.
-        */
-
-        const tokens =
-            Object.values(
-                symbolTokens
-            )
-                .map(
-                    item =>
-                        item.token
-                );
-
-
-        const request = {
-
-            correlationID:
-                "ema360live",
-
-            action:
-                1,
-
-            mode:
-                1,
-
-            exchangeType:
-                1,
-
-            tokens:
-                tokens
-
-        };
-
-
-        console.log(
-            `📡 Subscribing to ${tokens.length} instruments`
-        );
-
-
-        ws.fetchData(
-            request
-        );
-
-
-        /* =================================================
-           LIVE TICK
-        ================================================= */
-
-        ws.on(
-            "tick",
-            data => {
-
-                if (
-                    !data ||
-
-                    typeof data !==
-                    "object"
-                ) {
-
-                    return;
-                }
-
-
-                const token =
-                    String(
-                        data.token
-                    )
-                        .replace(
-                            /"/g,
-                            ""
-                        );
-
-
-                /*
-                   Angel One LTP is returned
-                   in paise-like format,
-                   so normalize it once
-                   on backend.
-                */
-
-                const rawLtp =
-                    Number(
-                        data.last_traded_price
-                    );
-
-
-                const normalizedTick = {
-
-                    ...data,
-
-                    token,
-
-                    ltp:
-                        Number.isFinite(
-                            rawLtp
-                        )
-                            ? rawLtp / 100
-                            : null
-
-                };
-
-
-                /*
-                   Keep latest tick for
-                   newly connected clients.
-                */
-
-                latestTicks[token] =
-                    normalizedTick;
-
-
-                console.log(
-                    "📈 LIVE TICK:",
-                    token,
-                    data.last_traded_price
-                );
-
-
-                /*
-                   Send the same live tick
-                   to every connected browser.
-
-                   IMPORTANT:
-
-                   Browser clients do NOT
-                   connect separately to
-                   Angel One.
-                */
-
-                const message =
-                    `data: ${JSON.stringify(normalizedTick)}\n\n`;
-
-
-                for (
-                    const client
-                    of clients
-                ) {
-
-                    try {
-
-                        client.write(
-                            message
-                        );
-
-                    }
-
-                    catch (error) {
-
-                        console.error(
-                            "❌ Failed to send tick to browser:",
-                            error
-                        );
-
-                    }
-                }
-
-            }
-        );
-
-
-    }
-
-    catch (error) {
-
-        console.error(
-            "❌ Angel One login error:"
-        );
-
-
-        console.error(
-            error
-        );
-
-    }
-}
 
 
 /* =========================================================
@@ -1318,7 +1527,7 @@ app.get(
 
         res.setHeader(
             "Access-Control-Allow-Origin",
-            "*"
+            FRONTEND_URL
         );
 
 
@@ -1340,11 +1549,20 @@ app.get(
 
         res.setHeader(
             "Access-Control-Allow-Origin",
-            "*"
+            FRONTEND_URL
         );
 
 
         try {
+
+            const authenticated = getAuthenticatedSession(req);
+
+            if (!authenticated?.session?.jwtToken) {
+                return res.status(401).json({
+                    success: false,
+                    message: "Connect an Angel One account first."
+                });
+            }
 
             const stock =
                 req.query.symbol;
@@ -1373,7 +1591,8 @@ app.get(
 
                     stock,
 
-                    timeframe
+                    timeframe,
+                    authenticated.session
 
                 );
 
@@ -1418,7 +1637,7 @@ app.get(
 
         res.setHeader(
             "Access-Control-Allow-Origin",
-            "*"
+            FRONTEND_URL
         );
 
 
@@ -1498,7 +1717,7 @@ app.get(
 
         res.setHeader(
             "Access-Control-Allow-Origin",
-            "*"
+            FRONTEND_URL
         );
 
 
@@ -1510,13 +1729,17 @@ app.get(
         );
 
 
-        clients.add(
-            res
-        );
+        const authenticated = getAuthenticatedSession(req);
 
+        if (!authenticated) {
+            return res.status(401).end();
+        }
+
+        const sessionId = authenticated.sessionId;
+        clients.set(res, sessionId);
 
         console.log(
-            "🌐 Browser connected to live stream"
+            `🌐 Browser connected to live stream for ${authenticated.session.user.clientId}`
         );
 
 
@@ -1529,10 +1752,13 @@ app.get(
            for the next Angel One tick.
         */
 
+        const sessionTicks =
+            latestTicksBySession.get(sessionId) || {};
+
         for (
             const tick
             of Object.values(
-                latestTicks
+                sessionTicks
             )
         ) {
 
@@ -6073,16 +6299,8 @@ async function startServer() {
 
     try {
 
-        /*
-           Login first.
-
-           Instrument master and
-           WebSocket are initialized
-           before the server starts.
-        */
-
-        await loginToAngelOne();
-
+        /* Instrument master is public metadata and does not require a fixed user login. */
+        await loadInstrumentMaster();
 
         app.listen(
 

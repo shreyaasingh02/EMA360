@@ -7,17 +7,15 @@ const API_BASE_URL = "http://localhost:3000";
 
 export async function getSymbols() {
 
-    const response =
-        await fetch(
-            `${API_BASE_URL}/api/symbols`
-        );
+    const response = await fetch(
+        `${API_BASE_URL}/api/symbols`,
+        {
+            credentials: "include"
+        }
+    );
 
     if (!response.ok) {
-
-        throw new Error(
-            `HTTP ${response.status}`
-        );
-
+        throw new Error(`HTTP ${response.status}`);
     }
 
     return await response.json();
@@ -25,7 +23,7 @@ export async function getSymbols() {
 
 
 /* =========================================================
-   GET HISTORICAL CANDLES
+   ANGEL ONE — HISTORICAL CANDLES
 ========================================================= */
 
 export async function getHistoricalCandles(
@@ -38,153 +36,196 @@ export async function getHistoricalCandles(
         `?symbol=${encodeURIComponent(symbol)}` +
         `&timeframe=${encodeURIComponent(timeframe)}`;
 
-    const response =
-        await fetch(url);
+    const response = await fetch(
+        url,
+        {
+            credentials: "include"
+        }
+    );
 
     if (!response.ok) {
-
-        throw new Error(
-            `HTTP ${response.status}`
-        );
-
+        throw new Error(`HTTP ${response.status}`);
     }
 
-    const data =
-        await response.json();
+    const data = await response.json();
 
     if (
         !Array.isArray(data) ||
         !data.length
     ) {
-
         throw new Error(
             `No candle data returned for ${symbol} ${timeframe}`
         );
-
     }
 
     return data;
 }
 
 
-
-
 /* =========================================================
-   GET NSE MARKET CANDLES
-   Used by Guest mode.
+   NSE — MARKET CANDLES
 ========================================================= */
-export async function getNseMarketCandles(symbol, timeframe) {
 
-    const url =
-        `${API_BASE_URL}/api/market/nse/candles` +
-        `?symbol=${encodeURIComponent(symbol)}` +
-        `&timeframe=${encodeURIComponent(timeframe)}`;
+export async function getNseMarketCandles(
+    symbol,
+    timeframe = "5M"
+) {
+    const normalizedSymbol = String(
+        symbol || ""
+    )
+        .trim()
+        .toUpperCase();
 
-    const response = await fetch(url);
+    const normalizedTimeframe = String(
+        timeframe || "5M"
+    )
+        .trim()
+        .toLowerCase();
+
+    const response = await fetch(
+        `${API_BASE_URL}/api/market/nse/candles?symbol=${encodeURIComponent(
+            normalizedSymbol
+        )}&timeframe=${encodeURIComponent(
+            normalizedTimeframe
+        )}`,
+        {
+            cache: "no-store"
+        }
+    );
 
     if (!response.ok) {
-        throw new Error(`NSE HTTP ${response.status}`);
-    }
-
-    const payload = await response.json();
-
-    if (!Array.isArray(payload?.candles) || !payload.candles.length) {
         throw new Error(
-            `No NSE candle data returned for ${symbol} ${timeframe}`
+            `NSE candles failed: HTTP ${response.status}`
         );
     }
 
-    return payload.candles;
+    const data = await response.json();
+
+    if (!data?.success) {
+        throw new Error(
+            data?.message || "NSE candles failed"
+        );
+    }
+
+    return Array.isArray(data.candles)
+        ? data.candles
+        : [];
 }
 
+
 /* =========================================================
-   GET NSE CURRENT QUOTE
-   Used by Guest mode for near-live LTP updates.
+   NSE — SINGLE MARKET QUOTE
 ========================================================= */
+
 export async function getNseMarketQuote(symbol) {
+    const normalizedSymbol = String(
+        symbol || ""
+    )
+        .trim()
+        .toUpperCase();
 
-    const url =
-        `${API_BASE_URL}/api/market/nse/quote` +
-        `?symbol=${encodeURIComponent(symbol)}`;
-
-    const response = await fetch(url);
-
-    if (!response.ok) {
-        throw new Error(`NSE quote HTTP ${response.status}`);
+    if (!normalizedSymbol) {
+        throw new Error("NSE symbol is required");
     }
 
-    const payload = await response.json();
+    const response = await fetch(
+        `${API_BASE_URL}/api/market/nse/quote?symbol=${encodeURIComponent(
+            normalizedSymbol
+        )}`,
+        {
+            cache: "no-store"
+        }
+    );
 
-    if (!payload?.success || !Number.isFinite(Number(payload?.price))) {
+    if (!response.ok) {
         throw new Error(
-            payload?.message ||
-            `No NSE live quote returned for ${symbol}`
+            `NSE quote failed: HTTP ${response.status}`
         );
     }
 
-    return payload;
+    const data = await response.json();
+
+    if (!data?.success) {
+        throw new Error(
+            data?.message || "NSE quote failed"
+        );
+    }
+
+    return data;
 }
 
+
 /* =========================================================
-   GET ALL NIFTY 50 NSE QUOTES
-   Used by Guest mode so the 50-stock table updates without
-   requiring the user to click each stock.
+   NSE — MULTIPLE MARKET QUOTES
 ========================================================= */
+
 export async function getNseMarketQuotes() {
-
     const response = await fetch(
-        `${API_BASE_URL}/api/market/nse/quotes`
+        `${API_BASE_URL}/api/market/nse/quotes`,
+        {
+            cache: "no-store"
+        }
     );
 
     if (!response.ok) {
-        throw new Error(`NSE quotes HTTP ${response.status}`);
-    }
-
-    const payload = await response.json();
-
-    if (!payload?.success || !payload?.quotes) {
         throw new Error(
-            payload?.message ||
-            "No NSE market quotes returned"
+            `NSE market quotes failed: HTTP ${response.status}`
         );
     }
 
-    return payload.quotes;
+    const data = await response.json();
+
+    if (!data?.success) {
+        throw new Error(
+            data?.message || "NSE market quotes failed"
+        );
+    }
+
+    return data.quotes || {};
 }
 
+
 /* =========================================================
-   GET NSE INDEX MARKET CARDS
+   NSE — MARKET INDICES
 ========================================================= */
-export async function getNseMarketIndices() {
 
+export async function getNseMarketIndices() {
     const response = await fetch(
-        `${API_BASE_URL}/api/market/nse/indices`
+        `${API_BASE_URL}/api/market/nse/indices`,
+        {
+            cache: "no-store"
+        }
     );
 
     if (!response.ok) {
-        throw new Error(`NSE indices HTTP ${response.status}`);
-    }
-
-    const payload = await response.json();
-
-    if (!payload?.success || !payload?.indices) {
         throw new Error(
-            payload?.message ||
-            "No NSE index data returned"
+            `NSE market indices failed: HTTP ${response.status}`
         );
     }
 
-    return payload.indices;
+    const data = await response.json();
+
+    if (!data?.success) {
+        throw new Error(
+            data?.message || "NSE market indices failed"
+        );
+    }
+
+    return data.indices || {};
 }
 
+
 /* =========================================================
-   CREATE LIVE STREAM
+   LIVE STREAM
 ========================================================= */
 
 export function createLiveStream() {
 
     return new EventSource(
-        `${API_BASE_URL}/api/stream`
+        `${API_BASE_URL}/api/stream`,
+        {
+            withCredentials: true
+        }
     );
 
 }

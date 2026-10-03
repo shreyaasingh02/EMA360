@@ -813,6 +813,89 @@ function useMarketData(dataSource = "angel") {
 
 
     /* =========================================================
+   FORCE INITIAL SELECTED STOCK LOAD
+   NSE GUEST + ANGEL ONE
+========================================================= */
+
+useEffect(() => {
+    let cancelled = false;
+
+    async function loadInitialSelectedStock() {
+        try {
+            console.log(
+                `🚀 INITIAL ${activeSource.toUpperCase()} LOAD:`,
+                selectedStock,
+                currentTF
+            );
+
+            const data = await getMarketCandles(
+                selectedStock,
+                currentTF
+            );
+
+            if (cancelled) return;
+
+            if (
+                !Array.isArray(data) ||
+                data.length === 0
+            ) {
+                console.error(
+                    `❌ INITIAL LOAD RETURNED NO DATA: ${selectedStock} ${currentTF}`
+                );
+                return;
+            }
+
+            if (!stockDataRef.current[selectedStock]) {
+                stockDataRef.current[selectedStock] = {};
+            }
+
+            stockDataRef.current[selectedStock][currentTF] =
+                data;
+
+            setStockData({
+                ...stockDataRef.current
+            });
+
+            setCandles(data);
+
+            if (data.length > 1) {
+                setPreviousPrice(
+                    data[data.length - 2].c
+                );
+            }
+
+            setDataVersion(
+                previous => previous + 1
+            );
+
+            console.log(
+                `✅ INITIAL DATA READY: ${selectedStock} ${currentTF}`,
+                data.length,
+                "candles"
+            );
+
+        } catch (error) {
+            console.error(
+                `❌ INITIAL ${activeSource.toUpperCase()} LOAD FAILED:`,
+                error
+            );
+        }
+    }
+
+    loadInitialSelectedStock();
+
+    return () => {
+        cancelled = true;
+    };
+
+}, [
+    activeSource,
+    selectedStock,
+    currentTF,
+    getMarketCandles
+]);
+
+    /* =========================================================
        LOAD ALL STOCK DATA
     ========================================================= */
 
@@ -1408,6 +1491,37 @@ function useMarketData(dataSource = "angel") {
         [selectedStock, getMarketCandles]
     );
 
+
+    // ============================================================
+// AUTO LOAD MARKET DATA WHEN DATA SOURCE CHANGES
+// ============================================================
+
+useEffect(() => {
+    let cancelled = false;
+
+    const startMarketData = async () => {
+        if (cancelled) return;
+
+        console.log(
+            `🚀 Loading market data for source: ${activeSource.toUpperCase()}`
+        );
+
+        try {
+            await loadAllStockData();
+        } catch (error) {
+            console.error(
+                `❌ Failed to load ${activeSource.toUpperCase()} market data:`,
+                error
+            );
+        }
+    };
+
+    startMarketData();
+
+    return () => {
+        cancelled = true;
+    };
+}, [activeSource, currentTF]);
 
     console.log(`📡 EMA360 market data source: ${activeSource.toUpperCase()}`);
 

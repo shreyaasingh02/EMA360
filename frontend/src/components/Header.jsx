@@ -155,67 +155,172 @@ function Header({
    * ---------------------------------------------------------
    */
 
-  function getMarketData(keys) {
-    // IMPORTANT:
-    // Header market cards are ALWAYS NSE.
-    // Even when the user is logged into / using Angel One,
-    // never read Angel One stockData for these cards.
+  const getMarketData = (keys) => {
+  const isAngelLoggedIn =
+    !!session && session?.dataSource === "angel";
 
-    let data = null;
+  // =========================================================
+  // ANGEL ONE MODE
+  // Use the SAME live stockData that the main dashboard uses.
+  // =========================================================
+  if (isAngelLoggedIn) {
+    let livePrice = null;
+    let matchedStock = null;
 
-    for (const key of keys || []) {
+    // Find the stock inside stockData using the header aliases
+    for (const key of keys) {
       const upperKey = String(key).toUpperCase();
 
-      if (nseHeaderQuotes?.[upperKey]) {
-        data = nseHeaderQuotes[upperKey];
-        break;
+      const stockKey = Object.keys(stockData || {}).find(
+        (stock) =>
+          String(stock).toUpperCase() === upperKey
+      );
+
+      if (!stockKey) continue;
+
+      const timeframeData = stockData?.[stockKey];
+
+      if (!timeframeData) continue;
+
+      // Find the newest candle from the available timeframes
+      let newestCandle = null;
+
+      for (const candles of Object.values(timeframeData)) {
+        if (!Array.isArray(candles) || !candles.length) continue;
+
+        const lastCandle = candles[candles.length - 1];
+
+        if (!lastCandle) continue;
+
+        if (
+          !newestCandle ||
+          new Date(lastCandle.time).getTime() >
+            new Date(newestCandle.time).getTime()
+        ) {
+          newestCandle = lastCandle;
+        }
       }
 
-      if (nseHeaderIndices?.[upperKey]) {
-        data = nseHeaderIndices[upperKey];
-        break;
-      }
+      if (newestCandle) {
+        livePrice = Number(newestCandle.c);
 
-      // Keep existing NSE props as an initial/fallback snapshot.
-      if (marketQuotes?.[upperKey]) {
-        data = marketQuotes[upperKey];
-        break;
-      }
-
-      if (marketIndices?.[upperKey]) {
-        data = marketIndices[upperKey];
-        break;
+        if (Number.isFinite(livePrice) && livePrice > 0) {
+          matchedStock = stockKey;
+          break;
+        }
       }
     }
 
-    if (!data) {
+    // ---------------------------------------------------------
+    // Use the existing Angel quote only for previous close
+    // ---------------------------------------------------------
+    let quote = null;
+
+    if (matchedStock) {
+      quote =
+        marketQuotes?.[matchedStock] ||
+        marketQuotes?.[String(matchedStock).toUpperCase()] ||
+        null;
+    }
+
+    const previousClose = Number(
+      quote?.previousClose ??
+      quote?.prevClose ??
+      quote?.close ??
+      0
+    );
+
+    let change = null;
+    let percent = null;
+
+    if (
+      Number.isFinite(previousClose) &&
+      previousClose > 0 &&
+      Number.isFinite(livePrice)
+    ) {
+      change = livePrice - previousClose;
+      percent = (change / previousClose) * 100;
+    }
+
+    if (Number.isFinite(livePrice) && livePrice > 0) {
       return {
-        price: null,
-        change: null,
-        percent: null,
+        price: livePrice,
+        change,
+        percent,
+        previousClose,
       };
     }
 
-    const price = Number(data.price);
-    const previousClose = Number(data.previousClose);
-
-    const change =
-      Number.isFinite(price) &&
-        Number.isFinite(previousClose) &&
-        previousClose > 0
-        ? price - previousClose
-        : null;
-
-    const percent = Number.isFinite(Number(data.change))
-      ? Number(data.change)
-      : null;
-
-    return {
-      price: Number.isFinite(price) ? price : null,
-      change,
-      percent,
-    };
+    // IMPORTANT:
+    // Do NOT fall back to NSE while Angel is logged in.
+    return null;
   }
+
+  // =========================================================
+  // GUEST / NSE MODE
+  // =========================================================
+  let data = null;
+
+  for (const key of keys) {
+    const upperKey = String(key).toUpperCase();
+
+    if (nseHeaderQuotes?.[upperKey]) {
+      data = nseHeaderQuotes[upperKey];
+      break;
+    }
+
+    if (nseHeaderIndices?.[upperKey]) {
+      data = nseHeaderIndices[upperKey];
+      break;
+    }
+  }
+
+  if (!data) return null;
+
+  const price = Number(
+    data?.price ??
+    data?.ltp ??
+    data?.lastPrice ??
+    0
+  );
+
+  const previousClose = Number(
+    data?.previousClose ??
+    data?.prevClose ??
+    data?.close ??
+    0
+  );
+
+  let change = Number(
+    data?.change ??
+    data?.percentChange ??
+    data?.pChange ??
+    0
+  );
+
+  let percent = Number(
+    data?.percent ??
+    data?.pChange ??
+    0
+  );
+
+  if (
+    (!Number.isFinite(percent) || percent === 0) &&
+    Number.isFinite(previousClose) &&
+    previousClose > 0 &&
+    Number.isFinite(price)
+  ) {
+    change = price - previousClose;
+    percent = (change / previousClose) * 100;
+  }
+
+  return {
+    price,
+    change,
+    percent,
+    previousClose,
+  };
+};
 
   /*
    * ---------------------------------------------------------

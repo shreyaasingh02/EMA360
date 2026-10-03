@@ -9,11 +9,16 @@ lerna-debug.log*
 
 # Dependencies
 node_modules/
+**/node_modules/
 
 # Build files
 dist/
 dist-ssr/
 build/
+
+# Vite
+.vite/
+
 
 # Environment variables
 .env
@@ -21,6 +26,8 @@ build/
 .env.development
 .env.production
 .env.*.local
+.env.*
+!.env.example
 
 # Editor directories and files
 .vscode/
