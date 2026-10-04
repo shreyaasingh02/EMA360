@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
+const Redis = require("ioredis");
 
 const { NseIndia } = require("stock-nse-india");
 
@@ -76,6 +77,53 @@ const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
  * There is intentionally NO fixed client code, PIN or TOTP secret in .env.
  */
 const authSessions = new Map();
+
+// Persistent session mirror for Render. The existing in-memory session
+// remains the primary store so the original Angel login flow is untouched.
+const REDIS_URL = String(process.env.REDIS_URL || "").trim();
+const SESSION_KEY_PREFIX = "ema360:session:";
+const SESSION_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
+const redis = REDIS_URL ? new Redis(REDIS_URL, {
+    maxRetriesPerRequest: 3,
+    enableReadyCheck: true,
+    lazyConnect: false
+}) : null;
+
+if (redis) {
+    redis.on("ready", () => console.log("🟢 EMA360 persistent session store connected"));
+    redis.on("error", error => console.error("❌ EMA360 session store error:", error?.message || error));
+}
+
+function sessionRedisKey(sessionId) {
+    return `${SESSION_KEY_PREFIX}${sessionId}`;
+}
+
+function saveSessionToRedis(sessionId, session) {
+    if (!redis) return Promise.resolve();
+    return redis.set(
+        sessionRedisKey(sessionId),
+        JSON.stringify(session),
+        "EX",
+        SESSION_TTL_SECONDS
+    );
+}
+
+async function loadSessionFromRedis(sessionId) {
+    if (!redis) return null;
+    const raw = await redis.get(sessionRedisKey(sessionId));
+    if (!raw) return null;
+    try {
+        return JSON.parse(raw);
+    } catch {
+        await redis.del(sessionRedisKey(sessionId));
+        return null;
+    }
+}
+
+function deleteSessionFromRedis(sessionId) {
+    if (!redis) return Promise.resolve();
+    return redis.del(sessionRedisKey(sessionId));
+}
 
 function timingSafeEqualText(a, b) {
     const aa = Buffer.from(String(a));
@@ -170,6 +218,26 @@ function getAuthenticatedSession(req) {
         `✅ AUTH DEBUG: SESSION VALID FOR ${session.user?.clientId || "unknown"}`
     );
 
+    return { sessionId, session };
+}
+
+async function getAuthenticatedSessionPersistent(req) {
+    const local = getAuthenticatedSession(req);
+    if (local) return local;
+
+    const cookies = parseCookies(req.headers.cookie || "");
+    const sessionId = cookies.ema360_session;
+    if (!sessionId) return null;
+
+    const session = await loadSessionFromRedis(sessionId);
+    if (!session) return null;
+
+    if (Date.now() > Number(session.expiresAt || 0)) {
+        await deleteSessionFromRedis(sessionId);
+        return null;
+    }
+
+    authSessions.set(sessionId, session);
     return { sessionId, session };
 }
 
@@ -290,13 +358,22 @@ app.post("/api/auth/angel/login", async (req, res) => {
 
         const sessionId = crypto.randomBytes(32).toString("hex");
 
-        authSessions.set(sessionId, {
+        const session = {
             user,
             jwtToken,
             refreshToken,
             feedToken,
             createdAt: Date.now(),
             expiresAt: Date.now() + SESSION_TTL_MS
+        };
+
+        // Keep the original in-memory session exactly as before.
+        authSessions.set(sessionId, session);
+
+        // Persist a copy for Render restarts, but NEVER make Angel login
+        // wait for Redis. This is deliberately additive to the old flow.
+        saveSessionToRedis(sessionId, session).catch(error => {
+            console.error("⚠️ Could not persist Angel session to Redis:", error?.message || error);
         });
 
         // Start this user's Angel One live feed.
@@ -333,8 +410,8 @@ app.post("/api/auth/angel/login", async (req, res) => {
    CURRENT EMA360 SESSION
 ========================================================= */
 
-app.get("/api/auth/me", (req, res) => {
-    const authenticated = getAuthenticatedSession(req);
+app.get("/api/auth/me", async (req, res) => {
+    const authenticated = await getAuthenticatedSessionPersistent(req);
 
     if (!authenticated) {
         return res.status(401).json({
@@ -356,7 +433,7 @@ app.get("/api/auth/me", (req, res) => {
 ========================================================= */
 
 app.post("/api/auth/logout", async (req, res) => {
-    const authenticated = getAuthenticatedSession(req);
+    const authenticated = await getAuthenticatedSessionPersistent(req);
 
     if (authenticated) {
         const { sessionId, session } = authenticated;
@@ -389,6 +466,7 @@ app.post("/api/auth/logout", async (req, res) => {
 
         stopAngelWebSocket(sessionId);
         authSessions.delete(sessionId);
+        await deleteSessionFromRedis(sessionId);
     }
 
     clearAuthCookie(res);
@@ -1580,7 +1658,7 @@ app.get(
 
         try {
 
-            const authenticated = getAuthenticatedSession(req);
+            const authenticated = await getAuthenticatedSessionPersistent(req);
 
             if (!authenticated?.session?.jwtToken) {
                 return res.status(401).json({
@@ -1720,7 +1798,7 @@ app.get(
 
 app.get(
     "/api/stream",
-    (req, res) => {
+    async (req, res) => {
 
         res.setHeader(
             "Content-Type",
@@ -1754,7 +1832,7 @@ app.get(
         );
 
 
-        const authenticated = getAuthenticatedSession(req);
+        const authenticated = await getAuthenticatedSessionPersistent(req);
 
         if (!authenticated) {
             return res.status(401).end();
