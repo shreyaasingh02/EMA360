@@ -10,7 +10,6 @@ import {
     createLiveStream
 } from "../services/api";
 
-
 function useMarketData(dataSource = "angel") {
 
     const activeSource = dataSource === "nse" ? "nse" : "angel";
@@ -48,14 +47,12 @@ function useMarketData(dataSource = "angel") {
     const [selectedStock, setSelectedStock] =
         useState("NIFTY 50");
 
-
     /* =========================================================
        CURRENT TIMEFRAME
     ========================================================= */
 
     const [currentTF, setCurrentTF] =
         useState("5M");
-
 
     /* =========================================================
        CURRENT CANDLES
@@ -64,7 +61,6 @@ function useMarketData(dataSource = "angel") {
     const [candles, setCandles] =
         useState([]);
 
-
     /* =========================================================
        PREVIOUS PRICE
     ========================================================= */
@@ -72,10 +68,8 @@ function useMarketData(dataSource = "angel") {
     const [previousPrice, setPreviousPrice] =
         useState(0);
 
-
     /* =========================================================
        STOCK DATA CACHE
-    =========================================================
 
        Old project:
 
@@ -94,17 +88,15 @@ function useMarketData(dataSource = "angel") {
     const [dataVersion, setDataVersion] =
         useState(0);
 
-    /* NSE-only live snapshots used by the Guest dashboard. */
+    /** NSE-only live snapshots used by the Guest dashboard. */
     const [marketQuotes, setMarketQuotes] =
         useState({});
 
     const [marketIndices, setMarketIndices] =
         useState({});
 
-
     /* =========================================================
        SELECTION REQUEST ID
-    =========================================================
 
        This preserves the old protection against an older
        async stock request overwriting a newer selection.
@@ -144,19 +136,22 @@ function useMarketData(dataSource = "angel") {
             ? new Date(exchangeTimestamp)
             : new Date();
 
-        /* Match the Angel One token to our frontend stock list. */
+        /** Match the Angel One token to our frontend stock list. */
         const tickStock =
             liveTokenMapRef.current[token] || null;
 
         if (!tickStock) return;
 
         const stockCache = stockDataRef.current[tickStock];
+
         if (!stockCache) return;
 
         const existing = stockCache[currentTF];
+
         if (!Array.isArray(existing) || !existing.length) return;
 
         const updated = existing.map(candle => ({ ...candle }));
+
         const last = updated[updated.length - 1];
 
         if (!last) return;
@@ -170,27 +165,36 @@ function useMarketData(dataSource = "angel") {
             currentTF === "1H" ? 60 :
             currentTF === "1D" ? 1440 : 5;
 
-        /* Daily candles should update their current day's OHLC. */
+        /** Daily candles should update their current day's OHLC. */
         let candleTime = new Date(tickTime);
 
         if (timeframeMinutes < 1440) {
+
             candleTime.setSeconds(0, 0);
+
             const minutes = candleTime.getMinutes();
+
             candleTime.setMinutes(
                 Math.floor(minutes / timeframeMinutes) * timeframeMinutes
             );
+
         } else {
+
             candleTime.setHours(0, 0, 0, 0);
+
         }
 
         const lastTime = new Date(last.time).getTime();
         const newTime = candleTime.getTime();
 
         if (newTime === lastTime) {
+
             last.c = price;
             last.h = Math.max(Number(last.h), price);
             last.l = Math.min(Number(last.l), price);
+
         } else if (newTime > lastTime) {
+
             updated.push({
                 time: candleTime.toISOString(),
                 o: price,
@@ -201,20 +205,26 @@ function useMarketData(dataSource = "angel") {
             });
 
             if (updated.length > 500) updated.shift();
+
         } else {
+
             return;
+
         }
 
         stockCache[currentTF] = updated;
 
-        /* Selected stock drives the chart/header immediately. */
+        /** Selected stock drives the chart/header immediately. */
         if (tickStock === selectedStock) {
+
             setCandles(updated);
+
             setPreviousPrice(
                 updated.length > 1
                     ? updated[updated.length - 2].c
                     : updated[0].c
             );
+
         }
 
         setStockData({
@@ -224,7 +234,6 @@ function useMarketData(dataSource = "angel") {
         setDataVersion(previous => previous + 1);
 
     }, [currentTF, selectedStock]);
-
 
     /* =========================================================
        ANGEL ONE LIVE STREAM
@@ -248,6 +257,7 @@ function useMarketData(dataSource = "angel") {
             } catch (_) {}
 
             const stream = createLiveStream();
+
             liveStreamRef.current = stream;
 
             stream.onopen = () => {
@@ -255,15 +265,23 @@ function useMarketData(dataSource = "angel") {
             };
 
             stream.onmessage = event => {
+
                 try {
+
                     const tick = JSON.parse(event.data);
+
                     applyLiveTick(tick);
+
                 } catch (error) {
+
                     console.error("❌ Live tick parse error:", error);
+
                 }
+
             };
 
             stream.onerror = error => {
+
                 console.error("❌ EMA360 live stream error:", error);
 
                 try {
@@ -273,14 +291,20 @@ function useMarketData(dataSource = "angel") {
                 if (!liveStreamMountedRef.current) return;
 
                 clearTimeout(liveStreamRetryRef.current);
-                liveStreamRetryRef.current = setTimeout(connect, 3000);
+
+                liveStreamRetryRef.current =
+                    setTimeout(connect, 3000);
+
             };
+
         };
 
         let cancelled = false;
 
         (async () => {
+
             try {
+
                 const symbols = await getSymbols();
 
                 if (cancelled || !symbols) return;
@@ -288,22 +312,42 @@ function useMarketData(dataSource = "angel") {
                 const map = {};
 
                 for (const [stock, info] of Object.entries(symbols)) {
+
                     if (info?.token != null) {
-                        map[String(info.token).replace(/"/g, "")] = stock;
+
+                        map[String(info.token).replace(/"/g, "")] =
+                            stock;
+
                     }
+
                 }
 
                 liveTokenMapRef.current = map;
-                console.log("🗺️ EMA360 live token map ready:", map);
+
+                console.log(
+                    "🗺️ EMA360 live token map ready:",
+                    map
+                );
+
                 connect();
+
             } catch (error) {
-                console.error("❌ Failed to load live token map:", error);
+
+                console.error(
+                    "❌ Failed to load live token map:",
+                    error
+                );
+
             }
+
         })();
 
         return () => {
+
             cancelled = true;
+
             liveStreamMountedRef.current = false;
+
             clearTimeout(liveStreamRetryRef.current);
 
             try {
@@ -311,15 +355,16 @@ function useMarketData(dataSource = "angel") {
             } catch (_) {}
 
             liveStreamRef.current = null;
+
         };
 
     }, [applyLiveTick, activeSource]);
-
 
     /* =========================================================
        NSE GUEST MARKET-WIDE LIVE UPDATES
 
        Guest mode must update the whole NIFTY 50 automatically.
+
        A stock click is only for selecting/displaying that stock;
        it must NOT be the thing that causes its data to refresh.
 
@@ -350,11 +395,15 @@ function useMarketData(dataSource = "angel") {
             1440;
 
         function getMarketBucket(date, minutes) {
+
             const input = new Date(date);
 
             if (minutes >= 1440) {
+
                 const day = new Date(input);
+
                 day.setHours(0, 0, 0, 0);
+
                 return day;
             }
 
@@ -369,6 +418,7 @@ function useMarketData(dataSource = "angel") {
             }).formatToParts(input);
 
             const values = {};
+
             for (const part of parts) {
                 values[part.type] = part.value;
             }
@@ -382,6 +432,7 @@ function useMarketData(dataSource = "angel") {
             const sessionStart = 9 * 60 + 15;
             const current = hour * 60 + minute;
             const elapsed = Math.max(0, current - sessionStart);
+
             const bucketMinutes =
                 sessionStart +
                 Math.floor(elapsed / minutes) * minutes;
@@ -405,6 +456,7 @@ function useMarketData(dataSource = "angel") {
         }
 
         function isNseTradingHours(date) {
+
             const parts = new Intl.DateTimeFormat("en-GB", {
                 timeZone: "Asia/Kolkata",
                 hour: "2-digit",
@@ -415,57 +467,83 @@ function useMarketData(dataSource = "angel") {
             const hour = Number(
                 parts.find(part => part.type === "hour")?.value
             );
+
             const minute = Number(
                 parts.find(part => part.type === "minute")?.value
             );
 
             const total = hour * 60 + minute;
-            return total >= 9 * 60 + 15 && total <= 15 * 60 + 30;
+
+            return total >= 9 * 60 + 15 &&
+                total <= 15 * 60 + 30;
         }
 
-        function mergeQuoteIntoTimeframe(stock, timeframe, quote) {
+        function mergeQuoteIntoTimeframe(
+            stock,
+            timeframe,
+            quote
+        ) {
+
             const price = Number(quote?.price);
-            if (!Number.isFinite(price) || price <= 0) return false;
+
+            if (!Number.isFinite(price) || price <= 0) {
+                return false;
+            }
 
             const stockCache = stockDataRef.current[stock];
+
             const existing = stockCache?.[timeframe];
 
             if (!Array.isArray(existing) || !existing.length) {
                 return false;
             }
 
-            const updated = existing.map(candle => ({ ...candle }));
-            const last = updated[updated.length - 1];
+            const updated =
+                existing.map(candle => ({ ...candle }));
+
+            const last =
+                updated[updated.length - 1];
+
             if (!last) return false;
 
             const quoteTime = new Date(
                 quote.timestamp || Date.now()
             );
 
-            const minutes = timeframeMinutes(timeframe);
-            const bucket = getMarketBucket(
-                quoteTime,
-                minutes
-            );
+            const minutes =
+                timeframeMinutes(timeframe);
+
+            const bucket =
+                getMarketBucket(
+                    quoteTime,
+                    minutes
+                );
 
             const bucketTime = bucket.getTime();
             const lastTime = new Date(last.time).getTime();
 
-            if (!Number.isFinite(lastTime)) return false;
+            if (!Number.isFinite(lastTime)) {
+                return false;
+            }
 
             if (
                 !isNseTradingHours(quoteTime) &&
                 minutes < 1440
             ) {
+
                 // Outside market hours do not create a fake new candle.
                 last.c = price;
                 last.h = Math.max(Number(last.h), price);
                 last.l = Math.min(Number(last.l), price);
+
             } else if (bucketTime === lastTime) {
+
                 last.c = price;
                 last.h = Math.max(Number(last.h), price);
                 last.l = Math.min(Number(last.l), price);
+
             } else if (bucketTime > lastTime) {
+
                 updated.push({
                     time: bucket.toISOString(),
                     o: price,
@@ -478,11 +556,15 @@ function useMarketData(dataSource = "angel") {
                 if (updated.length > 500) {
                     updated.shift();
                 }
+
             } else {
+
                 return false;
+
             }
 
             if (Number.isFinite(Number(quote.volume))) {
+
                 const dailyVolume = Number(quote.volume);
 
                 const dayKey = value =>
@@ -494,25 +576,31 @@ function useMarketData(dataSource = "angel") {
                     }).format(new Date(value));
 
                 const quoteDay = dayKey(quoteTime);
+
                 let completedVolume = 0;
 
                 for (let i = 0; i < updated.length - 1; i++) {
+
                     if (dayKey(updated[i].time) === quoteDay) {
                         completedVolume += Number(updated[i].v) || 0;
                     }
+
                 }
 
                 updated[updated.length - 1].v = Math.max(
                     0,
                     dailyVolume - completedVolume
                 );
+
             }
 
             stockCache[timeframe] = updated;
+
             return true;
         }
 
         function publishSelectedStock(stock) {
+
             const selected =
                 stockDataRef.current[stock]?.[currentTF];
 
@@ -521,6 +609,7 @@ function useMarketData(dataSource = "angel") {
             }
 
             setCandles(selected);
+
             setPreviousPrice(
                 selected.length > 1
                     ? selected[selected.length - 2].c
@@ -529,10 +618,14 @@ function useMarketData(dataSource = "angel") {
         }
 
         async function pollAllStocks() {
+
             if (cancelled) return;
 
             try {
-                const quotes = await getNseMarketQuotes();
+
+                const quotes =
+                    await getNseMarketQuotes();
+
                 if (cancelled) return;
 
                 setMarketQuotes(quotes || {});
@@ -540,7 +633,9 @@ function useMarketData(dataSource = "angel") {
                 let changed = false;
 
                 for (const stock of stocks) {
+
                     const quote = quotes?.[stock];
+
                     if (!quote) continue;
 
                     // Keep the table's current timeframe live.
@@ -551,12 +646,19 @@ function useMarketData(dataSource = "angel") {
                             quote
                         )
                     ) {
+
                         changed = true;
+
                     }
 
                     // Keep MTF RSI data live for the selected stock too.
                     if (stock === selectedStock) {
-                        for (const timeframe of ["5M", "15M", "1H"]) {
+
+                        for (
+                            const timeframe of
+                            ["5M", "15M", "1H"]
+                        ) {
+
                             if (
                                 timeframe !== currentTF &&
                                 mergeQuoteIntoTimeframe(
@@ -565,64 +667,98 @@ function useMarketData(dataSource = "angel") {
                                     quote
                                 )
                             ) {
+
                                 changed = true;
+
                             }
+
                         }
+
                     }
+
                 }
 
                 if (changed) {
+
                     publishSelectedStock(selectedStock);
+
                     setStockData({
                         ...stockDataRef.current
                     });
-                    setDataVersion(previous => previous + 1);
+
+                    setDataVersion(
+                        previous => previous + 1
+                    );
+
                 }
+
             } catch (error) {
+
                 console.warn(
                     "⚠️ NSE NIFTY 50 market-wide poll failed:",
                     error?.message || error
                 );
+
             } finally {
+
                 if (!cancelled) {
+
                     timer = window.setTimeout(
                         pollAllStocks,
                         2000
                     );
+
                 }
+
             }
+
         }
 
         async function pollIndices() {
+
             if (cancelled) return;
 
             try {
-                const indices = await getNseMarketIndices();
+
+                const indices =
+                    await getNseMarketIndices();
+
                 if (!cancelled) {
                     setMarketIndices(indices || {});
                 }
+
             } catch (error) {
+
                 console.warn(
                     "⚠️ NSE header index poll failed:",
                     error?.message || error
                 );
+
             } finally {
+
                 if (!cancelled) {
+
                     indexTimer = window.setTimeout(
                         pollIndices,
                         5000
                     );
+
                 }
+
             }
+
         }
 
         pollAllStocks();
         pollIndices();
 
         return () => {
+
             cancelled = true;
+
             if (timer) window.clearTimeout(timer);
             if (indexTimer) window.clearTimeout(indexTimer);
+
         };
 
     }, [
@@ -692,7 +828,6 @@ function useMarketData(dataSource = "angel") {
 
     ];
 
-
     /* =========================================================
        LOAD SELECTED STOCK MTF
     ========================================================= */
@@ -701,7 +836,9 @@ function useMarketData(dataSource = "angel") {
         async (stock) => {
 
             if (!stock) {
+
                 console.error("❌ MTF load: stock is missing");
+
                 return;
             }
 
@@ -745,9 +882,11 @@ function useMarketData(dataSource = "angel") {
                         !Array.isArray(data) ||
                         !data.length
                     ) {
+
                         throw new Error(
                             `No candles returned for ${stock} ${timeframe}`
                         );
+
                     }
 
                     /*
@@ -788,7 +927,9 @@ function useMarketData(dataSource = "angel") {
                         `❌ Failed ${stock} ${timeframe}:`,
                         error
                     );
+
                 }
+
             }
 
             /*
@@ -807,93 +948,104 @@ function useMarketData(dataSource = "angel") {
             console.log(
                 `🏁 MTF COMPLETE FOR: ${stock}`
             );
+
         },
         [getMarketCandles]
     );
 
-
     /* =========================================================
-   FORCE INITIAL SELECTED STOCK LOAD
-   NSE GUEST + ANGEL ONE
-========================================================= */
+       FORCE INITIAL SELECTED STOCK LOAD
+       NSE GUEST + ANGEL ONE
+    ========================================================= */
 
-useEffect(() => {
-    let cancelled = false;
+    useEffect(() => {
 
-    async function loadInitialSelectedStock() {
-        try {
-            console.log(
-                `🚀 INITIAL ${activeSource.toUpperCase()} LOAD:`,
-                selectedStock,
-                currentTF
-            );
+        let cancelled = false;
 
-            const data = await getMarketCandles(
-                selectedStock,
-                currentTF
-            );
+        async function loadInitialSelectedStock() {
 
-            if (cancelled) return;
+            try {
 
-            if (
-                !Array.isArray(data) ||
-                data.length === 0
-            ) {
+                console.log(
+                    `🚀 INITIAL ${activeSource.toUpperCase()} LOAD:`,
+                    selectedStock,
+                    currentTF
+                );
+
+                const data =
+                    await getMarketCandles(
+                        selectedStock,
+                        currentTF
+                    );
+
+                if (cancelled) return;
+
+                if (
+                    !Array.isArray(data) ||
+                    data.length === 0
+                ) {
+
+                    console.error(
+                        `❌ INITIAL LOAD RETURNED NO DATA: ${selectedStock} ${currentTF}`
+                    );
+
+                    return;
+                }
+
+                if (!stockDataRef.current[selectedStock]) {
+                    stockDataRef.current[selectedStock] = {};
+                }
+
+                stockDataRef.current[selectedStock][currentTF] =
+                    data;
+
+                setStockData({
+                    ...stockDataRef.current
+                });
+
+                setCandles(data);
+
+                if (data.length > 1) {
+
+                    setPreviousPrice(
+                        data[data.length - 2].c
+                    );
+
+                }
+
+                setDataVersion(
+                    previous => previous + 1
+                );
+
+                console.log(
+                    `✅ INITIAL DATA READY: ${selectedStock} ${currentTF}`,
+                    data.length,
+                    "candles"
+                );
+
+            } catch (error) {
+
                 console.error(
-                    `❌ INITIAL LOAD RETURNED NO DATA: ${selectedStock} ${currentTF}`
+                    `❌ INITIAL ${activeSource.toUpperCase()} LOAD FAILED:`,
+                    error
                 );
-                return;
+
             }
 
-            if (!stockDataRef.current[selectedStock]) {
-                stockDataRef.current[selectedStock] = {};
-            }
-
-            stockDataRef.current[selectedStock][currentTF] =
-                data;
-
-            setStockData({
-                ...stockDataRef.current
-            });
-
-            setCandles(data);
-
-            if (data.length > 1) {
-                setPreviousPrice(
-                    data[data.length - 2].c
-                );
-            }
-
-            setDataVersion(
-                previous => previous + 1
-            );
-
-            console.log(
-                `✅ INITIAL DATA READY: ${selectedStock} ${currentTF}`,
-                data.length,
-                "candles"
-            );
-
-        } catch (error) {
-            console.error(
-                `❌ INITIAL ${activeSource.toUpperCase()} LOAD FAILED:`,
-                error
-            );
         }
-    }
 
-    loadInitialSelectedStock();
+        loadInitialSelectedStock();
 
-    return () => {
-        cancelled = true;
-    };
+        return () => {
+            cancelled = true;
+        };
 
-}, [
-    activeSource,
-    selectedStock,
-    currentTF,
-    getMarketCandles
-]);
+    }, [
+        activeSource,
+        selectedStock,
+        currentTF,
+        getMarketCandles
+    ]);
 
     /* =========================================================
        LOAD ALL STOCK DATA
@@ -907,7 +1059,6 @@ useEffect(() => {
                     `🚀 Starting EMA360 startup...`
                 );
 
-
                 /* =====================================================
                    STEP 1 — NIFTY FIRST
                 ===================================================== */
@@ -915,20 +1066,17 @@ useEffect(() => {
                 const priorityStock =
                     "NIFTY 50";
 
-
                 try {
 
                     console.log(
                         `⭐ PRIORITY: Loading ${priorityStock} ${currentTF} first...`
                     );
 
-
                     const data =
                         await getMarketCandles(
                             priorityStock,
                             currentTF
                         );
-
 
                     if (
                         !Array.isArray(data) ||
@@ -941,14 +1089,12 @@ useEffect(() => {
 
                     }
 
-
                     if (!stockDataRef.current[priorityStock]) {
 
                         stockDataRef.current[priorityStock] =
                             {};
 
                     }
-
 
                     stockDataRef.current[
                         priorityStock
@@ -959,9 +1105,7 @@ useEffect(() => {
                         ...stockDataRef.current
                     });
 
-
                     setCandles(data);
-
 
                     if (data.length > 1) {
 
@@ -971,11 +1115,9 @@ useEffect(() => {
 
                     }
 
-
                     console.log(
                         `✅ PRIORITY READY: ${priorityStock} ${currentTF} — ${data.length} REAL candles`
                     );
-
 
                     /*
                      * Load the 5M / 15M / 1H data required
@@ -986,11 +1128,9 @@ useEffect(() => {
                         `⭐ Loading NIFTY MTF...`
                     );
 
-
                     await loadSelectedStockMTF(
                         priorityStock
                     );
-
 
                     /*
                      * Restore NIFTY candles after MTF loading.
@@ -998,14 +1138,12 @@ useEffect(() => {
 
                     const restoredCandles =
                         stockDataRef.current[
-                        priorityStock
+                            priorityStock
                         ]?.[currentTF] || [];
-
 
                     setCandles(
                         restoredCandles
                     );
-
 
                     if (
                         restoredCandles.length > 1
@@ -1018,7 +1156,6 @@ useEffect(() => {
                         );
 
                     }
-
 
                     console.log(
                         `🎯 NIFTY 50 DASHBOARD READY`
@@ -1033,7 +1170,6 @@ useEffect(() => {
 
                 }
 
-
                 /* =====================================================
                    STEP 2 — BACKGROUND TABLE LOADING
                 ===================================================== */
@@ -1042,13 +1178,11 @@ useEffect(() => {
                     `📊 NIFTY ready. Starting background stock loading...`
                 );
 
-
                 const backgroundStocks =
                     stocks.filter(
                         stock =>
                             stock !== priorityStock
                     );
-
 
                 /*
                  * NSE Guest mode: load the complete 50-stock table in
@@ -1058,19 +1192,30 @@ useEffect(() => {
                  *
                  * Keep concurrency low so NSE is not hammered.
                  */
+
                 if (activeSource === "nse") {
+
                     let nextIndex = 0;
+
                     const workerCount = 3;
 
                     const loadNseWorker = async () => {
-                        while (true) {
-                            const index = nextIndex++;
 
-                            if (index >= backgroundStocks.length) {
+                        while (true) {
+
+                            const index =
+                                nextIndex++;
+
+                            if (
+                                index >=
+                                backgroundStocks.length
+                            ) {
+
                                 return;
                             }
 
-                            const stock = backgroundStocks[index];
+                            const stock =
+                                backgroundStocks[index];
 
                             if (
                                 Array.isArray(
@@ -1078,50 +1223,63 @@ useEffect(() => {
                                 ) &&
                                 stockDataRef.current[stock][currentTF].length
                             ) {
+
                                 continue;
                             }
 
                             try {
+
                                 console.log(
                                     `📡 NSE background loading ${stock} ${currentTF}...`
                                 );
 
-                                const data = await getMarketCandles(
-                                    stock,
-                                    currentTF
-                                );
+                                const data =
+                                    await getMarketCandles(
+                                        stock,
+                                        currentTF
+                                    );
 
                                 if (
                                     !Array.isArray(data) ||
                                     !data.length
                                 ) {
+
                                     throw new Error(
                                         `No candle data for ${stock} ${currentTF}`
                                     );
+
                                 }
 
                                 if (!stockDataRef.current[stock]) {
                                     stockDataRef.current[stock] = {};
                                 }
 
-                                stockDataRef.current[stock][currentTF] = data;
+                                stockDataRef.current[stock][currentTF] =
+                                    data;
 
                                 setStockData({
                                     ...stockDataRef.current
                                 });
 
-                                setDataVersion(previous => previous + 1);
+                                setDataVersion(
+                                    previous => previous + 1
+                                );
 
                                 console.log(
                                     `✅ NSE ${stock} ${currentTF}: ${data.length} REAL candles`
                                 );
+
                             } catch (error) {
+
                                 console.error(
                                     `❌ NSE ${stock} ${currentTF} failed:`,
                                     error
                                 );
+
                             }
+
                         }
+
                     };
 
                     await Promise.all(
@@ -1135,61 +1293,78 @@ useEffect(() => {
                             () => loadNseWorker()
                         )
                     );
+
                 } else {
+
                     /*
                      * Existing Angel One startup behavior is preserved.
                      */
+
                     for (const stock of backgroundStocks) {
+
                         if (
                             Array.isArray(
                                 stockDataRef.current[stock]?.[currentTF]
                             ) &&
                             stockDataRef.current[stock][currentTF].length
                         ) {
+
                             continue;
                         }
 
                         try {
+
                             console.log(
                                 `📡 Background loading ${stock} ${currentTF}...`
                             );
 
-                            const data = await getMarketCandles(
-                                stock,
-                                currentTF
-                            );
+                            const data =
+                                await getMarketCandles(
+                                    stock,
+                                    currentTF
+                                );
 
                             if (
                                 !Array.isArray(data) ||
                                 !data.length
                             ) {
+
                                 throw new Error(
                                     `No candle data for ${stock} ${currentTF}`
                                 );
+
                             }
 
                             if (!stockDataRef.current[stock]) {
                                 stockDataRef.current[stock] = {};
                             }
 
-                            stockDataRef.current[stock][currentTF] = data;
+                            stockDataRef.current[stock][currentTF] =
+                                data;
 
                             setStockData({
                                 ...stockDataRef.current
                             });
 
-                            setDataVersion(previous => previous + 1);
+                            setDataVersion(
+                                previous => previous + 1
+                            );
 
                             console.log(
                                 `✅ ${stock} ${currentTF}: ${data.length} REAL candles`
                             );
+
                         } catch (error) {
+
                             console.error(
                                 `❌ ${stock} ${currentTF} failed:`,
                                 error
                             );
+
                         }
+
                     }
+
                 }
 
                 console.log(
@@ -1205,7 +1380,6 @@ useEffect(() => {
             ]
         );
 
-
     /* =========================================================
        SELECT STOCK
     ========================================================= */
@@ -1217,16 +1391,13 @@ useEffect(() => {
                 const requestId =
                     ++selectionRequestId.current;
 
-
                 setSelectedStock(
                     stock
                 );
 
-
                 console.log(
                     `🎯 Selected stock: ${stock}`
                 );
-
 
                 try {
 
@@ -1237,9 +1408,8 @@ useEffect(() => {
 
                     let selectedCandles =
                         stockDataRef.current[
-                        stock
+                            stock
                         ]?.[currentTF];
-
 
                     if (
                         Array.isArray(
@@ -1252,7 +1422,6 @@ useEffect(() => {
                             selectedCandles
                         );
 
-
                         console.log(
                             `♻️ Using cached ${stock} ${currentTF} data`
                         );
@@ -1263,13 +1432,11 @@ useEffect(() => {
                             `📡 Loading ${stock} ${currentTF} candles...`
                         );
 
-
                         selectedCandles =
                             await getMarketCandles(
                                 stock,
                                 currentTF
                             );
-
 
                         /*
                          * Do not allow an older request
@@ -1285,7 +1452,6 @@ useEffect(() => {
 
                         }
 
-
                         if (
                             !Array.isArray(
                                 selectedCandles
@@ -1299,14 +1465,12 @@ useEffect(() => {
 
                         }
 
-
                         if (!stockDataRef.current[stock]) {
 
                             stockDataRef.current[stock] =
                                 {};
 
                         }
-
 
                         stockDataRef.current[
                             stock
@@ -1317,18 +1481,15 @@ useEffect(() => {
                             ...stockDataRef.current
                         });
 
-
                         setCandles(
                             selectedCandles
                         );
-
 
                         console.log(
                             `✅ ${stock} ${currentTF}: ${selectedCandles.length} REAL candles`
                         );
 
                     }
-
 
                     /* =================================================
                        2. SET PREVIOUS PRICE SAFELY
@@ -1346,7 +1507,6 @@ useEffect(() => {
 
                     }
 
-
                     /* =================================================
                        3. LOAD 5M / 15M / 1H
                           FOR MTF RSI
@@ -1356,7 +1516,6 @@ useEffect(() => {
                         stock
                     );
 
-
                     if (
                         requestId !==
                         selectionRequestId.current
@@ -1365,7 +1524,6 @@ useEffect(() => {
                         return;
 
                     }
-
 
                     console.log(
                         `✅ ${stock} is ready`
@@ -1380,7 +1538,6 @@ useEffect(() => {
 
                 }
 
-
                 window.scrollTo({
                     top: 0,
                     behavior: "smooth"
@@ -1394,19 +1551,19 @@ useEffect(() => {
             ]
         );
 
-
-
     /* =========================================================
-   LOAD SELECTED TIMEFRAME
-========================================================= */
+       LOAD SELECTED TIMEFRAME
+    ========================================================= */
 
     const loadSelectedTimeframe = useCallback(
         async (timeframe, stock = selectedStock) => {
 
             if (!stock) {
+
                 console.error(
                     "❌ Cannot load timeframe: stock missing"
                 );
+
                 return;
             }
 
@@ -1430,9 +1587,11 @@ useEffect(() => {
                     !Array.isArray(data) ||
                     !data.length
                 ) {
+
                     throw new Error(
                         `No candles for ${stock} ${timeframe}`
                     );
+
                 }
 
                 /*
@@ -1461,6 +1620,7 @@ useEffect(() => {
                     setPreviousPrice(
                         data[data.length - 2].c
                     );
+
                 }
 
                 /*
@@ -1487,43 +1647,53 @@ useEffect(() => {
                 );
 
             }
+
         },
         [selectedStock, getMarketCandles]
     );
 
-
     // ============================================================
-// AUTO LOAD MARKET DATA WHEN DATA SOURCE CHANGES
-// ============================================================
+    // AUTO LOAD MARKET DATA WHEN DATA SOURCE CHANGES
+    // ============================================================
 
-useEffect(() => {
-    let cancelled = false;
+    useEffect(() => {
 
-    const startMarketData = async () => {
-        if (cancelled) return;
+        let cancelled = false;
 
-        console.log(
-            `🚀 Loading market data for source: ${activeSource.toUpperCase()}`
-        );
+        const startMarketData = async () => {
 
-        try {
-            await loadAllStockData();
-        } catch (error) {
-            console.error(
-                `❌ Failed to load ${activeSource.toUpperCase()} market data:`,
-                error
+            if (cancelled) return;
+
+            console.log(
+                `🚀 Loading market data for source: ${activeSource.toUpperCase()}`
             );
-        }
-    };
 
-    startMarketData();
+            try {
 
-    return () => {
-        cancelled = true;
-    };
-}, [activeSource, currentTF]);
+                await loadAllStockData();
 
-    console.log(`📡 EMA360 market data source: ${activeSource.toUpperCase()}`);
+            } catch (error) {
+
+                console.error(
+                    `❌ Failed to load ${activeSource.toUpperCase()} market data:`,
+                    error
+                );
+
+            }
+
+        };
+
+        startMarketData();
+
+        return () => {
+            cancelled = true;
+        };
+
+    }, [activeSource, currentTF]);
+
+    console.log(
+        `📡 EMA360 market data source: ${activeSource.toUpperCase()}`
+    );
 
     /* =========================================================
        RETURN
@@ -1560,6 +1730,5 @@ useEffect(() => {
     };
 
 }
-
 
 export default useMarketData;
