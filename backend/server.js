@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
+const Redis = require("ioredis");
 
 const { NseIndia } = require("stock-nse-india");
 
@@ -64,76 +65,96 @@ app.use(express.json({ limit: "1mb" }));
    - Configure the exact callback URL in the Angel One API app.
    - New Login authentication is handled by the documented login API.
      The old Publisher redirect flow is not used by this server. Current Angel One API-app rules can vary by app type.
-   - Sessions are kept in memory in this version. A persistent store
-     should be used before deploying multiple backend instances.
+   - Production sessions are stored in Render Key Value through REDIS_URL.
+   - Local development can fall back to an in-memory store when REDIS_URL is absent.
 ========================================================= */
 
 const SESSION_COOKIE = "ema360_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
+const SESSION_KEY_PREFIX = "ema360:session:";
 
 /*
- * Each EMA360 browser session owns its own Angel One SmartAPI session.
- * There is intentionally NO fixed client code, PIN or TOTP secret in .env.
+ * Production sessions live in Render Key Value (Redis/Valkey-compatible).
+ * A small in-memory fallback is kept only for local development when
+ * REDIS_URL is not configured.
+ *
+ * Angel JWT/feed/refresh tokens remain server-side and are never sent to
+ * the browser or stored in localStorage.
  */
-const authSessions = new Map();
+const localAuthSessions = new Map();
+const REDIS_URL = String(process.env.REDIS_URL || "").trim();
+const isProduction = process.env.NODE_ENV === "production";
 
-function timingSafeEqualText(a, b) {
-    const aa = Buffer.from(String(a));
-    const bb = Buffer.from(String(b));
-
-    if (aa.length !== bb.length) return false;
-    return crypto.timingSafeEqual(aa, bb);
+if (isProduction && !REDIS_URL) {
+    console.error(
+        "❌ REDIS_URL is required in production. Create a Render Key Value instance and connect it to EMA360-backend."
+    );
 }
 
-function parseCookies(header = "") {
-    const cookies = {};
+const redis = REDIS_URL
+    ? new Redis(REDIS_URL, {
+        maxRetriesPerRequest: 3,
+        enableReadyCheck: true,
+        lazyConnect: false
+    })
+    : null;
 
-    for (const part of String(header).split(";")) {
-        const index = part.indexOf("=");
-        if (index === -1) continue;
+if (redis) {
+    redis.on("ready", () => {
+        console.log("🟢 EMA360 session store connected (Render Key Value)");
+    });
 
-        const key = part.slice(0, index).trim();
-        const value = part.slice(index + 1).trim();
-        if (!key) continue;
+    redis.on("error", (error) => {
+        console.error("❌ EMA360 session store error:", error?.message || error);
+    });
+}
+
+function sessionRedisKey(sessionId) {
+    return `${SESSION_KEY_PREFIX}${sessionId}`;
+}
+
+async function saveAuthSession(sessionId, session) {
+    if (redis) {
+        await redis.set(
+            sessionRedisKey(sessionId),
+            JSON.stringify(session),
+            "EX",
+            SESSION_TTL_SECONDS
+        );
+        return;
+    }
+
+    localAuthSessions.set(sessionId, session);
+}
+
+async function loadAuthSession(sessionId) {
+    if (redis) {
+        const raw = await redis.get(sessionRedisKey(sessionId));
+        if (!raw) return null;
 
         try {
-            cookies[key] = decodeURIComponent(value);
-        } catch {
-            cookies[key] = value;
+            return JSON.parse(raw);
+        } catch (error) {
+            console.error("❌ Invalid stored EMA360 session:", error);
+            await redis.del(sessionRedisKey(sessionId));
+            return null;
         }
     }
 
-    return cookies;
+    return localAuthSessions.get(sessionId) || null;
 }
 
-function cookieFlags(maxAgeSeconds) {
-    const isProduction =
-        process.env.NODE_ENV === "production";
-
-    if (isProduction) {
-        return `Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${maxAgeSeconds}`;
+async function deleteAuthSession(sessionId) {
+    if (redis) {
+        await redis.del(sessionRedisKey(sessionId));
+        return;
     }
 
-    return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
+    localAuthSessions.delete(sessionId);
 }
 
-function setAuthCookie(res, sessionId) {
-    res.setHeader(
-        "Set-Cookie",
-        `ema360_session=${encodeURIComponent(sessionId)}; ${cookieFlags(
-            Math.floor(SESSION_TTL_MS / 1000)
-        )}`
-    );
-}
-
-function clearAuthCookie(res) {
-    res.setHeader(
-        "Set-Cookie",
-        `ema360_session=; ${cookieFlags(0)}`
-    );
-}
-
-function getAuthenticatedSession(req) {
+async function getAuthenticatedSession(req) {
     const cookies = parseCookies(req.headers.cookie || "");
     const sessionId = cookies.ema360_session;
 
@@ -141,10 +162,7 @@ function getAuthenticatedSession(req) {
         path: req.path,
         hasCookie: Boolean(sessionId),
         cookieLength: sessionId ? sessionId.length : 0,
-        sessionExists: sessionId
-            ? authSessions.has(sessionId)
-            : false,
-        activeSessions: authSessions.size,
+        sessionStore: redis ? "render-key-value" : "memory-local-dev",
         cfRay: req.headers["cf-ray"] || null
     });
 
@@ -153,17 +171,22 @@ function getAuthenticatedSession(req) {
         return null;
     }
 
-    const session = authSessions.get(sessionId);
+    const session = await loadAuthSession(sessionId);
 
     if (!session) {
         console.log("❌ AUTH DEBUG: COOKIE EXISTS BUT SESSION NOT FOUND");
         return null;
     }
 
-    if (Date.now() > session.expiresAt) {
+    if (Date.now() > Number(session.expiresAt || 0)) {
         console.log("❌ AUTH DEBUG: SESSION EXPIRED");
-        authSessions.delete(sessionId);
+        await deleteAuthSession(sessionId);
         return null;
+    }
+
+    // Refresh the Redis TTL while the session is actively being used.
+    if (redis) {
+        await redis.expire(sessionRedisKey(sessionId), SESSION_TTL_SECONDS);
     }
 
     console.log(
@@ -290,17 +313,19 @@ app.post("/api/auth/angel/login", async (req, res) => {
 
         const sessionId = crypto.randomBytes(32).toString("hex");
 
-        authSessions.set(sessionId, {
+        const session = {
             user,
             jwtToken,
             refreshToken,
             feedToken,
             createdAt: Date.now(),
             expiresAt: Date.now() + SESSION_TTL_MS
-        });
+        };
+
+        await saveAuthSession(sessionId, session);
 
         // Start this user's Angel One live feed.
-        await startAngelWebSocket(sessionId, authSessions.get(sessionId));
+        await startAngelWebSocket(sessionId, session);
 
         setAuthCookie(res, sessionId);
 
@@ -333,8 +358,8 @@ app.post("/api/auth/angel/login", async (req, res) => {
    CURRENT EMA360 SESSION
 ========================================================= */
 
-app.get("/api/auth/me", (req, res) => {
-    const authenticated = getAuthenticatedSession(req);
+app.get("/api/auth/me", async (req, res) => {
+    const authenticated = await getAuthenticatedSession(req);
 
     if (!authenticated) {
         return res.status(401).json({
@@ -356,7 +381,7 @@ app.get("/api/auth/me", (req, res) => {
 ========================================================= */
 
 app.post("/api/auth/logout", async (req, res) => {
-    const authenticated = getAuthenticatedSession(req);
+    const authenticated = await getAuthenticatedSession(req);
 
     if (authenticated) {
         const { sessionId, session } = authenticated;
@@ -388,7 +413,7 @@ app.post("/api/auth/logout", async (req, res) => {
         }
 
         stopAngelWebSocket(sessionId);
-        authSessions.delete(sessionId);
+        await deleteAuthSession(sessionId);
     }
 
     clearAuthCookie(res);
@@ -399,16 +424,6 @@ app.post("/api/auth/logout", async (req, res) => {
     });
 });
 
-setInterval(() => {
-    const now = Date.now();
-
-    for (const [sessionId, session] of authSessions.entries()) {
-        if (now > session.expiresAt) {
-            stopAngelWebSocket(sessionId);
-            authSessions.delete(sessionId);
-        }
-    }
-}, 60 * 1000).unref();
 
 const clients = new Map();
 
@@ -1580,7 +1595,7 @@ app.get(
 
         try {
 
-            const authenticated = getAuthenticatedSession(req);
+            const authenticated = await getAuthenticatedSession(req);
 
             if (!authenticated?.session?.jwtToken) {
                 return res.status(401).json({
@@ -1720,7 +1735,7 @@ app.get(
 
 app.get(
     "/api/stream",
-    (req, res) => {
+    async (req, res) => {
 
         res.setHeader(
             "Content-Type",
@@ -1754,13 +1769,28 @@ app.get(
         );
 
 
-        const authenticated = getAuthenticatedSession(req);
+        const authenticated = await getAuthenticatedSession(req);
 
         if (!authenticated) {
             return res.status(401).end();
         }
 
         const sessionId = authenticated.sessionId;
+
+        // A Render restart clears process-local WebSocket state, but the
+        // authenticated session survives in Render Key Value. Reconnect the
+        // Angel feed when the browser opens the stream again.
+        if (!angelWebSockets.has(sessionId)) {
+            try {
+                await startAngelWebSocket(sessionId, authenticated.session);
+            } catch (error) {
+                console.error(
+                    "❌ Failed to restore Angel One live feed:",
+                    error?.message || error
+                );
+            }
+        }
+
         clients.set(res, sessionId);
 
         console.log(
@@ -6323,6 +6353,12 @@ const PORT =
 async function startServer() {
 
     try {
+
+        if (isProduction && !REDIS_URL) {
+            throw new Error(
+                "REDIS_URL is missing. Connect EMA360-backend to a Render Key Value instance before starting production."
+            );
+        }
 
         /* Instrument master is public metadata and does not require a fixed user login. */
         await loadInstrumentMaster();
