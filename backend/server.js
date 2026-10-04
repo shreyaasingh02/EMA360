@@ -245,6 +245,7 @@ app.post("/api/auth/angel/login", async (req, res) => {
         }
 
         console.log(`🔐 Angel One login attempt for client ${clientId}`);
+        console.log("📡 Sending Angel One authentication request...");
 
         const loginResponse = await axios.post(
             "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
@@ -267,6 +268,13 @@ app.post("/api/auth/angel/login", async (req, res) => {
         );
 
         const login = loginResponse.data;
+
+        console.log("📥 Angel One authentication response received:", {
+            status: login?.status,
+            message: login?.message || null,
+            hasJwtToken: Boolean(login?.data?.jwtToken),
+            hasFeedToken: Boolean(login?.data?.feedToken)
+        });
 
         if (!login?.status || !login?.data?.jwtToken) {
             console.error("❌ Angel One login rejected:", login);
@@ -324,14 +332,24 @@ app.post("/api/auth/angel/login", async (req, res) => {
 
         await saveAuthSession(sessionId, session);
 
-        // Start this user's Angel One live feed.
-        await startAngelWebSocket(sessionId, session);
-
+        // IMPORTANT: do not wait for the Angel One WebSocket before
+        // replying to the browser. A WebSocket connection can take
+        // time or hang on Render, which would leave the frontend stuck
+        // on "Connecting" even though Angel authentication succeeded.
         setAuthCookie(res, sessionId);
 
         console.log(
-            `✅ Angel One login successful for ${connectedClientId}`
+            `✅ Angel One authentication + session created for ${connectedClientId}`
         );
+
+        // Start the live feed in the background. Historical API calls
+        // can already use the JWT stored in the server-side session.
+        startAngelWebSocket(sessionId, session).catch(error => {
+            console.error(
+                `❌ Background Angel One WebSocket start failed for ${connectedClientId}:`,
+                error?.message || error
+            );
+        });
 
         return res.json({
             success: true,
@@ -1781,14 +1799,14 @@ app.get(
         // authenticated session survives in Render Key Value. Reconnect the
         // Angel feed when the browser opens the stream again.
         if (!angelWebSockets.has(sessionId)) {
-            try {
-                await startAngelWebSocket(sessionId, authenticated.session);
-            } catch (error) {
+            // Do not block the SSE connection while Angel One WebSocket
+            // reconnects. This is especially important on Render.
+            startAngelWebSocket(sessionId, authenticated.session).catch(error => {
                 console.error(
                     "❌ Failed to restore Angel One live feed:",
                     error?.message || error
                 );
-            }
+            });
         }
 
         clients.set(res, sessionId);
