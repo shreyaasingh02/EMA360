@@ -4,11 +4,64 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const Redis = require("ioredis");
 
 const { NseIndia } = require("stock-nse-india");
 
-const nseIndia = new NseIndia();
+/*
+ * IMPORTANT NSE PRODUCTION CONTROL
+ * --------------------------------
+ * Render was previously opening many NSE requests at the same time.
+ * That is especially bad for NSE/Akamai-protected endpoints.
+ *
+ * Keep ONE NseIndia instance and serialize every NSE SDK call through a
+ * small queue. This does not bypass NSE protection; it simply prevents EMA360
+ * from creating request bursts. A 403 is never retried aggressively.
+ */
+const rawNseIndia = new NseIndia();
+
+const NSE_QUEUE_MIN_GAP_MS = Math.max(500, Number(process.env.NSE_QUEUE_MIN_GAP_MS || 1200));
+let nseQueue = Promise.resolve();
+let nseLastRequestAt = 0;
+
+function queueNseCall(label, fn) {
+    const run = nseQueue.then(async () => {
+        const wait = Math.max(0, NSE_QUEUE_MIN_GAP_MS - (Date.now() - nseLastRequestAt));
+        if (wait > 0) {
+            await new Promise(resolve => setTimeout(resolve, wait));
+        }
+
+        nseLastRequestAt = Date.now();
+
+        try {
+            return await fn();
+        } catch (error) {
+            const status = error?.response?.status || error?.status || "";
+            if (String(status) === "403" || /403/.test(String(error?.message || ""))) {
+                console.error(`❌ NSE 403 (${label}). No aggressive retry will be attempted.`);
+            }
+            throw error;
+        }
+    });
+
+    // Keep the queue alive after a failed request.
+    nseQueue = run.catch(() => undefined);
+    return run;
+}
+
+// Proxy all SDK methods so existing EMA360 code automatically uses the queue.
+const nseIndia = new Proxy(rawNseIndia, {
+    get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver);
+
+        if (typeof value !== "function") {
+            return value;
+        }
+
+        return (...args) =>
+            queueNseCall(String(property), () => value.apply(target, args));
+    }
+});
+
 // Cache NSE symbols and tokens so we don't repeatedly fetch them
 let NSE_STOCKS_CACHE = [];
 const NSE_TOKEN_CACHE = new Map();
@@ -65,27 +118,19 @@ app.use(express.json({ limit: "1mb" }));
    - Configure the exact callback URL in the Angel One API app.
    - New Login authentication is handled by the documented login API.
      The old Publisher redirect flow is not used by this server. Current Angel One API-app rules can vary by app type.
-   - Production sessions are stored in Render Key Value through REDIS_URL.
-   - Local development can fall back to an in-memory store when REDIS_URL is absent.
+   - Sessions are kept in memory in this version. A persistent store
+     should be used before deploying multiple backend instances.
 ========================================================= */
 
 const SESSION_COOKIE = "ema360_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const SESSION_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
-const SESSION_KEY_PREFIX = "ema360:session:";
 
 /*
- * Production sessions live in Render Key Value (Redis/Valkey-compatible).
- * A small in-memory fallback is kept only for local development when
- * REDIS_URL is not configured.
- *
- * Angel JWT/feed/refresh tokens remain server-side and are never sent to
- * the browser or stored in localStorage.
+ * Each EMA360 browser session owns its own Angel One SmartAPI session.
+ * There is intentionally NO fixed client code, PIN or TOTP secret in .env.
  */
-const localAuthSessions = new Map();
+const authSessions = new Map();
 
-// These cookie helpers are part of the original working Angel One login flow.
-// Keep them intact; Redis persistence is additive and must never replace them.
 function timingSafeEqualText(a, b) {
     const aa = Buffer.from(String(a));
     const bb = Buffer.from(String(b));
@@ -116,9 +161,10 @@ function parseCookies(header = "") {
 }
 
 function cookieFlags(maxAgeSeconds) {
-    const production = process.env.NODE_ENV === "production";
+    const isProduction =
+        process.env.NODE_ENV === "production";
 
-    if (production) {
+    if (isProduction) {
         return `Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${maxAgeSeconds}`;
     }
 
@@ -128,7 +174,7 @@ function cookieFlags(maxAgeSeconds) {
 function setAuthCookie(res, sessionId) {
     res.setHeader(
         "Set-Cookie",
-        `${SESSION_COOKIE}=${encodeURIComponent(sessionId)}; ${cookieFlags(
+        `ema360_session=${encodeURIComponent(sessionId)}; ${cookieFlags(
             Math.floor(SESSION_TTL_MS / 1000)
         )}`
     );
@@ -137,85 +183,11 @@ function setAuthCookie(res, sessionId) {
 function clearAuthCookie(res) {
     res.setHeader(
         "Set-Cookie",
-        `${SESSION_COOKIE}=; ${cookieFlags(0)}`
+        `ema360_session=; ${cookieFlags(0)}`
     );
 }
 
-const REDIS_URL = String(process.env.REDIS_URL || "").trim();
-const isProduction = process.env.NODE_ENV === "production";
-
-if (isProduction && !REDIS_URL) {
-    console.error(
-        "❌ REDIS_URL is required in production. Create a Render Key Value instance and connect it to EMA360-backend."
-    );
-}
-
-const redis = REDIS_URL
-    ? new Redis(REDIS_URL, {
-        maxRetriesPerRequest: 3,
-        enableReadyCheck: true,
-        lazyConnect: false
-    })
-    : null;
-
-if (redis) {
-    redis.on("ready", () => {
-        console.log("🟢 EMA360 session store connected (Render Key Value)");
-    });
-
-    redis.on("error", (error) => {
-        console.error("❌ EMA360 session store error:", error?.message || error);
-    });
-}
-
-function sessionRedisKey(sessionId) {
-    return `${SESSION_KEY_PREFIX}${sessionId}`;
-}
-
-function saveAuthSession(sessionId, session) {
-    // Always keep the current instance session immediately available.
-    // Redis is persistence, not a prerequisite for completing login.
-    localAuthSessions.set(sessionId, session);
-
-    if (!redis) return Promise.resolve();
-
-    return redis.set(
-        sessionRedisKey(sessionId),
-        JSON.stringify(session),
-        "EX",
-        SESSION_TTL_SECONDS
-    );
-}
-
-async function loadAuthSession(sessionId) {
-    const local = localAuthSessions.get(sessionId);
-    if (local) return local;
-
-    if (!redis) return null;
-
-    const raw = await redis.get(sessionRedisKey(sessionId));
-    if (!raw) return null;
-
-    try {
-        const session = JSON.parse(raw);
-        localAuthSessions.set(sessionId, session);
-        return session;
-    } catch (error) {
-        console.error("❌ Invalid stored EMA360 session:", error);
-        await redis.del(sessionRedisKey(sessionId));
-        return null;
-    }
-}
-
-async function deleteAuthSession(sessionId) {
-    localAuthSessions.delete(sessionId);
-
-    if (redis) {
-        await redis.del(sessionRedisKey(sessionId));
-    }
-}
-
-async function getAuthenticatedSession(req) {
+function getAuthenticatedSession(req) {
     const cookies = parseCookies(req.headers.cookie || "");
     const sessionId = cookies.ema360_session;
 
@@ -223,7 +195,10 @@ async function getAuthenticatedSession(req) {
         path: req.path,
         hasCookie: Boolean(sessionId),
         cookieLength: sessionId ? sessionId.length : 0,
-        sessionStore: redis ? "render-key-value" : "memory-local-dev",
+        sessionExists: sessionId
+            ? authSessions.has(sessionId)
+            : false,
+        activeSessions: authSessions.size,
         cfRay: req.headers["cf-ray"] || null
     });
 
@@ -232,22 +207,17 @@ async function getAuthenticatedSession(req) {
         return null;
     }
 
-    const session = await loadAuthSession(sessionId);
+    const session = authSessions.get(sessionId);
 
     if (!session) {
         console.log("❌ AUTH DEBUG: COOKIE EXISTS BUT SESSION NOT FOUND");
         return null;
     }
 
-    if (Date.now() > Number(session.expiresAt || 0)) {
+    if (Date.now() > session.expiresAt) {
         console.log("❌ AUTH DEBUG: SESSION EXPIRED");
-        await deleteAuthSession(sessionId);
+        authSessions.delete(sessionId);
         return null;
-    }
-
-    // Refresh the Redis TTL while the session is actively being used.
-    if (redis) {
-        await redis.expire(sessionRedisKey(sessionId), SESSION_TTL_SECONDS);
     }
 
     console.log(
@@ -306,7 +276,6 @@ app.post("/api/auth/angel/login", async (req, res) => {
         }
 
         console.log(`🔐 Angel One login attempt for client ${clientId}`);
-        console.log("📡 Sending Angel One authentication request...");
 
         const loginResponse = await axios.post(
             "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
@@ -329,13 +298,6 @@ app.post("/api/auth/angel/login", async (req, res) => {
         );
 
         const login = loginResponse.data;
-
-        console.log("📥 Angel One authentication response received:", {
-            status: login?.status,
-            message: login?.message || null,
-            hasJwtToken: Boolean(login?.data?.jwtToken),
-            hasFeedToken: Boolean(login?.data?.feedToken)
-        });
 
         if (!login?.status || !login?.data?.jwtToken) {
             console.error("❌ Angel One login rejected:", login);
@@ -382,42 +344,23 @@ app.post("/api/auth/angel/login", async (req, res) => {
 
         const sessionId = crypto.randomBytes(32).toString("hex");
 
-        const session = {
+        authSessions.set(sessionId, {
             user,
             jwtToken,
             refreshToken,
             feedToken,
             createdAt: Date.now(),
             expiresAt: Date.now() + SESSION_TTL_MS
-        };
-
-        // Persist in the background. The original login flow must respond
-        // immediately after creating the in-memory session and cookie.
-        saveAuthSession(sessionId, session).catch(error => {
-            console.error(
-                "⚠️ Could not persist Angel session to Render Key Value:",
-                error?.message || error
-            );
         });
 
-        // IMPORTANT: do not wait for Redis or the Angel One WebSocket before
-        // replying to the browser. A WebSocket connection can take
-        // time or hang on Render, which would leave the frontend stuck
-        // on "Connecting" even though Angel authentication succeeded.
+        // Start this user's Angel One live feed.
+        await startAngelWebSocket(sessionId, authSessions.get(sessionId));
+
         setAuthCookie(res, sessionId);
 
         console.log(
-            `✅ Angel One authentication + session created for ${connectedClientId}`
+            `✅ Angel One login successful for ${connectedClientId}`
         );
-
-        // Start the live feed in the background. Historical API calls
-        // can already use the JWT stored in the server-side session.
-        startAngelWebSocket(sessionId, session).catch(error => {
-            console.error(
-                `❌ Background Angel One WebSocket start failed for ${connectedClientId}:`,
-                error?.message || error
-            );
-        });
 
         return res.json({
             success: true,
@@ -444,8 +387,8 @@ app.post("/api/auth/angel/login", async (req, res) => {
    CURRENT EMA360 SESSION
 ========================================================= */
 
-app.get("/api/auth/me", async (req, res) => {
-    const authenticated = await getAuthenticatedSession(req);
+app.get("/api/auth/me", (req, res) => {
+    const authenticated = getAuthenticatedSession(req);
 
     if (!authenticated) {
         return res.status(401).json({
@@ -467,7 +410,7 @@ app.get("/api/auth/me", async (req, res) => {
 ========================================================= */
 
 app.post("/api/auth/logout", async (req, res) => {
-    const authenticated = await getAuthenticatedSession(req);
+    const authenticated = getAuthenticatedSession(req);
 
     if (authenticated) {
         const { sessionId, session } = authenticated;
@@ -499,7 +442,7 @@ app.post("/api/auth/logout", async (req, res) => {
         }
 
         stopAngelWebSocket(sessionId);
-        await deleteAuthSession(sessionId);
+        authSessions.delete(sessionId);
     }
 
     clearAuthCookie(res);
@@ -510,6 +453,16 @@ app.post("/api/auth/logout", async (req, res) => {
     });
 });
 
+setInterval(() => {
+    const now = Date.now();
+
+    for (const [sessionId, session] of authSessions.entries()) {
+        if (now > session.expiresAt) {
+            stopAngelWebSocket(sessionId);
+            authSessions.delete(sessionId);
+        }
+    }
+}, 60 * 1000).unref();
 
 const clients = new Map();
 
@@ -1681,7 +1634,7 @@ app.get(
 
         try {
 
-            const authenticated = await getAuthenticatedSession(req);
+            const authenticated = getAuthenticatedSession(req);
 
             if (!authenticated?.session?.jwtToken) {
                 return res.status(401).json({
@@ -1821,7 +1774,7 @@ app.get(
 
 app.get(
     "/api/stream",
-    async (req, res) => {
+    (req, res) => {
 
         res.setHeader(
             "Content-Type",
@@ -1855,28 +1808,13 @@ app.get(
         );
 
 
-        const authenticated = await getAuthenticatedSession(req);
+        const authenticated = getAuthenticatedSession(req);
 
         if (!authenticated) {
             return res.status(401).end();
         }
 
         const sessionId = authenticated.sessionId;
-
-        // A Render restart clears process-local WebSocket state, but the
-        // authenticated session survives in Render Key Value. Reconnect the
-        // Angel feed when the browser opens the stream again.
-        if (!angelWebSockets.has(sessionId)) {
-            // Do not block the SSE connection while Angel One WebSocket
-            // reconnects. This is especially important on Render.
-            startAngelWebSocket(sessionId, authenticated.session).catch(error => {
-                console.error(
-                    "❌ Failed to restore Angel One live feed:",
-                    error?.message || error
-                );
-            });
-        }
-
         clients.set(res, sessionId);
 
         console.log(
@@ -4841,12 +4779,13 @@ async function fetchNseMarketQuote(symbol) {
             let result;
 
             if (normalizedSymbol === "NIFTY 50") {
-                // This package method uses NSE's index endpoint and handles
-                // the NSE session/cookie flow for us.
-                const indexData =
-                    await nseIndia.getEquityStockIndices("NIFTY 50");
-
-                const meta = indexData?.metadata || {};
+                // Reuse the single all-indices snapshot instead of opening
+                // another NIFTY 50 request every time the header polls.
+                const allIndices = await fetchNseAllIndices();
+                const meta = findNseIndexMeta(
+                    allIndices,
+                    ["NIFTY 50", "NIFTY"]
+                ) || {};
                 const price = Number(meta.last);
                 const previousClose = Number(meta.previousClose);
 
@@ -5229,6 +5168,56 @@ let NSE_HEADER_INDICES_CACHE = {
     indices: {}
 };
 
+let NSE_ALL_INDICES_CACHE = {
+    timestamp: 0,
+    data: null
+};
+
+const NSE_ALL_INDICES_CACHE_MS = 5000;
+
+async function fetchNseAllIndices() {
+    const now = Date.now();
+
+    if (
+        NSE_ALL_INDICES_CACHE.data &&
+        now - NSE_ALL_INDICES_CACHE.timestamp < NSE_ALL_INDICES_CACHE_MS
+    ) {
+        return NSE_ALL_INDICES_CACHE.data;
+    }
+
+    const data = await nseIndia.getAllIndices();
+
+    NSE_ALL_INDICES_CACHE = {
+        timestamp: Date.now(),
+        data
+    };
+
+    return data;
+}
+
+function findNseIndexMeta(payload, aliases) {
+    const rows = Array.isArray(payload?.data)
+        ? payload.data
+        : Array.isArray(payload)
+            ? payload
+            : [];
+
+    const wanted = aliases.map(value => String(value).trim().toUpperCase());
+
+    const row = rows.find(item => {
+        const name = String(
+            item?.index ||
+            item?.indexSymbol ||
+            item?.name ||
+            ""
+        ).trim().toUpperCase();
+
+        return wanted.includes(name);
+    });
+
+    return row || null;
+}
+
 async function fetchNseHeaderIndices() {
     const now = Date.now();
 
@@ -5261,61 +5250,55 @@ async function fetchNseHeaderIndices() {
         ["NIFTYSMALL100", "NIFTY SMLCAP 100"]
     ];
 
-    const entries = await Promise.all(
-        indexNames.map(async ([label, nseIndexName]) => {
-            try {
-                const indexData =
-                    await nseIndia.getEquityStockIndices(nseIndexName);
+    let allIndices;
 
-                const meta = indexData?.metadata || {};
-                const price = pickNumber(
-                    meta.last,
-                    meta.lastPrice,
-                    meta.ltp,
-                    meta.close
-                );
-
-                if (!Number.isFinite(price)) {
-                    return [label, null];
-                }
-
-                const previousClose = pickNumber(
-                    meta.previousClose,
-                    meta.prevClose
-                );
-
-                const change =
-                    Number.isFinite(previousClose) && previousClose > 0
-                        ? ((price - previousClose) / previousClose) * 100
-                        : pickNumber(meta.percChange, meta.pChange);
-
-                return [
-                    label,
-                    {
-                        source: "NSE",
-                        name: label,
-                        price,
-                        previousClose,
-                        change: Number.isFinite(change) ? change : null,
-                        timestamp: new Date().toISOString()
-                    }
-                ];
-            } catch (error) {
-                console.warn(
-                    `⚠️ NSE header index ${nseIndexName} failed:`,
-                    error?.message || error
-                );
-                return [label, null];
-            }
-        })
-    );
+    try {
+        allIndices = await fetchNseAllIndices();
+    } catch (error) {
+        console.warn(
+            "⚠️ NSE all-indices snapshot failed:",
+            error?.message || error
+        );
+        throw error;
+    }
 
     const output = {};
 
-    for (const [label, value] of entries) {
-        if (value) {
-            output[label] = value;
-        }
+    for (const [label, nseIndexName] of indexNames) {
+        const row = findNseIndexMeta(
+            allIndices,
+            [label, nseIndexName]
+        );
+
+        if (!row) continue;
+
+        const price = pickNumber(
+            row?.last,
+            row?.lastPrice,
+            row?.ltp,
+            row?.close
+        );
+
+        if (!Number.isFinite(price)) continue;
+
+        const previousClose = pickNumber(
+            row?.previousClose,
+            row?.prevClose
+        );
+
+        const change =
+            Number.isFinite(previousClose) && previousClose > 0
+                ? ((price - previousClose) / previousClose) * 100
+                : pickNumber(row?.percentChange, row?.pChange, row?.percChange);
+
+        output[label] = {
+            source: "NSE",
+            name: label,
+            price,
+            previousClose,
+            change: Number.isFinite(change) ? change : null,
+            timestamp: new Date().toISOString()
+        };
     }
 
     /*
@@ -6439,12 +6422,6 @@ const PORT =
 async function startServer() {
 
     try {
-
-        if (isProduction && !REDIS_URL) {
-            throw new Error(
-                "REDIS_URL is missing. Connect EMA360-backend to a Render Key Value instance before starting production."
-            );
-        }
 
         /* Instrument master is public metadata and does not require a fixed user login. */
         await loadInstrumentMaster();
