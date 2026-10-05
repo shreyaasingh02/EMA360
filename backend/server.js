@@ -4441,207 +4441,94 @@ async function getNseMarketCandles(symbol, timeframe = "5m") {
         .trim()
         .toLowerCase();
 
-    /*
-     * =========================================================
-     * NSE EQUITY STOCKS
-     * =========================================================
-     *
-     * IMPORTANT:
-     * Do NOT use MCP live snapshots for chart history.
-     *
-     * The existing getNseCandles() function already fetches
-     * proper NSE historical OHLC candles with enough history
-     * for EMA / RSI / ADX / VWAP / S/R calculations.
-     */
-    if (normalizedSymbol !== "NIFTY 50") {
+    console.log(
+        "🇮🇳 NSE MARKET CANDLES:",
+        normalizedSymbol,
+        tf
+    );
+
+    // =========================================================
+    // NIFTY 50
+    // =========================================================
+    //
+    // DO NOT send NIFTY through getNseToken().
+    //
+    // It is an INDEX, not an equity.
+    //
+    // =========================================================
+
+    if (normalizedSymbol === "NIFTY 50") {
 
         console.log(
-            "🇮🇳 NSE HISTORICAL EQUITY CANDLES:",
-            normalizedSymbol,
-            tf
+            "🇮🇳 NIFTY 50 → index candle request"
         );
 
-        const candles = await getNseCandles(
-            normalizedSymbol,
-            tf,
-            true
-        );
+        try {
 
-        return normalizeMarketCandleShape(candles);
-    }
+            const indexData =
+                await nseIndia.getEquityStockIndices(
+                    "NIFTY 50"
+                );
 
-    /*
-     * =========================================================
-     * NIFTY 50 INDEX
-     * =========================================================
-     *
-     * NIFTY 50 is an INDEX, not an equity.
-     *
-     * Therefore we use NSE's charting OHLC endpoint with
-     * symbolType = "Index".
-     */
-    const timeframeConfig = {
+            console.log(
+                "🇮🇳 NIFTY INDEX RESPONSE:",
+                indexData
+            );
 
-        "1m": {
-            interval: 1,
-            days: 15
-        },
+            /*
+             * The current NSE library does not provide the same
+             * historical equity-token path for NIFTY 50.
+             *
+             * Therefore DON'T manufacture OHLC candles from
+             * a single live price.
+             *
+             * Return [] here until a proper index OHLC source
+             * is available.
+             */
 
-        "3m": {
-            interval: 3,
-            days: 30
-        },
+            return [];
 
-        "5m": {
-            interval: 5,
-            days: 60
-        },
+        } catch (error) {
 
-        "15m": {
-            interval: 15,
-            days: 120
-        },
+            console.error(
+                "❌ NIFTY 50 INDEX ERROR:",
+                error?.message || error
+            );
 
-        "30m": {
-            interval: 30,
-            days: 180
-        },
-
-        "1h": {
-            interval: 60,
-            days: 365
-        },
-
-        "1d": {
-            interval: "D",
-            days: 1000
+            return [];
         }
-
-    };
-
-    const config = timeframeConfig[tf];
-
-    if (!config) {
-        throw new Error(
-            `Unsupported NSE NIFTY timeframe: ${tf}`
-        );
     }
 
-    const now = new Date();
-
-    const start = new Date(
-        now.getTime() -
-        config.days * 24 * 60 * 60 * 1000
-    );
+    // =========================================================
+    // ALL NSE EQUITIES
+    // =========================================================
 
     try {
 
-        /*
-         * Get NIFTY 50's NSE charting token.
-         */
-        const symbolInfo =
-            await nseIndia.getEquitySymbolInfo(
-                "NIFTY 50"
-            );
-
-        const token =
-            symbolInfo?.scripcode ||
-            symbolInfo?.scripCode ||
-            symbolInfo?.token;
-
-        console.log(
-            "🇮🇳 NIFTY 50 NSE TOKEN:",
-            token
-        );
-
-        if (!token) {
-            throw new Error(
-                "NIFTY 50 charting token was not returned by NSE"
-            );
-        }
-
-        /*
-         * Fetch REAL historical NIFTY OHLC candles.
-         */
-        const response =
-            await nseIndia.getEquityChartHistoricalData(
-                "NIFTY 50",
-                {
-                    start,
-                    end: now
-                },
-                token,
-                "Index",
-                tf === "1d" ? "D" : "I",
-                config.interval
-            );
-
         const candles =
-            normalizeMarketCandleShape(
-                normalizeNseCandles(response)
+            await getNseCandles(
+                normalizedSymbol,
+                tf,
+                true
             );
 
         console.log(
-            "🇮🇳 NIFTY 50 NSE OHLC:",
-            tf,
-            "candles =",
-            candles.length,
-            "last =",
-            candles.at(-1)
+            "🇮🇳 NSE EQUITY CANDLES:",
+            normalizedSymbol,
+            "COUNT:",
+            candles?.length || 0
         );
 
-        if (candles.length) {
-            return candles;
-        }
-
-        throw new Error(
-            "NSE NIFTY 50 charting returned no OHLC candles"
+        return normalizeMarketCandleShape(
+            candles || []
         );
 
     } catch (error) {
 
         console.error(
-            `❌ NIFTY 50 NSE historical candles failed (${tf}):`,
+            `❌ NSE EQUITY CANDLE ERROR ${normalizedSymbol}:`,
             error?.message || error
         );
-
-        /*
-         * Daily fallback.
-         */
-        if (tf === "1d") {
-
-            try {
-
-                const historical =
-                    await nseIndia.getIndexHistoricalData(
-                        "NIFTY 50",
-                        {
-                            start,
-                            end: now
-                        }
-                    );
-
-                const candles =
-                    normalizeMarketCandleShape(
-                        normalizeNseIndexHistorical(
-                            historical
-                        )
-                    );
-
-                if (candles.length) {
-                    return candles;
-                }
-
-            } catch (fallbackError) {
-
-                console.error(
-                    "❌ NIFTY 50 daily fallback failed:",
-                    fallbackError?.message ||
-                    fallbackError
-                );
-
-            }
-        }
 
         return [];
     }
