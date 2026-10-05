@@ -72,41 +72,40 @@ function sleep(ms) {
 
 
 function parseSse(text) {
-
   const messages = [];
-
   let event = "message";
-
   let data = [];
 
-  for (const line of String(text || "").split(/r?n/)) {
-
-    if (line.startsWith("event:")) event = line.slice(6).trim();
-
-    else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
-
-    else if (line === "" && data.length) {
-
-      messages.push({ event, data: data.join("n") });
+  for (const line of String(text || "").split(/\r?\n/)) {
+    if (line.startsWith("event:")) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      data.push(line.slice(5).trimStart());
+    } else if (line === "" && data.length) {
+      messages.push({
+        event,
+        data: data.join("\n")
+      });
 
       event = "message";
-
       data = [];
-
     }
-
   }
 
-  if (data.length) messages.push({ event, data: data.join("n") });
+  if (data.length) {
+    messages.push({
+      event,
+      data: data.join("\n")
+    });
+  }
 
   for (const item of messages.reverse()) {
-
-    try { return JSON.parse(item.data); } catch (_) {}
-
+    try {
+      return JSON.parse(item.data);
+    } catch (_) {}
   }
 
   return null;
-
 }
 
 
