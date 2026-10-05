@@ -4,13 +4,66 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const Redis = require("ioredis");
 
 const { NseIndia } = require("stock-nse-india");
 const { NseMcpClient } = require("./nseMcpClient");
-
-const nseIndia = new NseIndia();
 const nseMcpClient = new NseMcpClient();
+
+/*
+ * IMPORTANT NSE PRODUCTION CONTROL
+ * --------------------------------
+ * Render was previously opening many NSE requests at the same time.
+ * That is especially bad for NSE/Akamai-protected endpoints.
+ *
+ * Keep ONE NseIndia instance and serialize every NSE SDK call through a
+ * small queue. This does not bypass NSE protection; it simply prevents EMA360
+ * from creating request bursts. A 403 is never retried aggressively.
+ */
+const rawNseIndia = new NseIndia();
+
+const NSE_QUEUE_MIN_GAP_MS = Math.max(500, Number(process.env.NSE_QUEUE_MIN_GAP_MS || 1200));
+let nseQueue = Promise.resolve();
+let nseLastRequestAt = 0;
+
+function queueNseCall(label, fn) {
+    const run = nseQueue.then(async () => {
+        const wait = Math.max(0, NSE_QUEUE_MIN_GAP_MS - (Date.now() - nseLastRequestAt));
+        if (wait > 0) {
+            await new Promise(resolve => setTimeout(resolve, wait));
+        }
+
+        nseLastRequestAt = Date.now();
+
+        try {
+            return await fn();
+        } catch (error) {
+            const status = error?.response?.status || error?.status || "";
+            if (String(status) === "403" || /403/.test(String(error?.message || ""))) {
+                console.error(`❌ NSE 403 (${label}). No aggressive retry will be attempted.`);
+            }
+            throw error;
+        }
+    });
+
+    // Keep the queue alive after a failed request.
+    nseQueue = run.catch(() => undefined);
+    return run;
+}
+
+// Proxy all SDK methods so existing EMA360 code automatically uses the queue.
+const nseIndia = new Proxy(rawNseIndia, {
+    get(target, property, receiver) {
+        const value = Reflect.get(target, property, receiver);
+
+        if (typeof value !== "function") {
+            return value;
+        }
+
+        return (...args) =>
+            queueNseCall(String(property), () => value.apply(target, args));
+    }
+});
+
 // Cache NSE symbols and tokens so we don't repeatedly fetch them
 let NSE_STOCKS_CACHE = [];
 const NSE_TOKEN_CACHE = new Map();
@@ -67,96 +120,76 @@ app.use(express.json({ limit: "1mb" }));
    - Configure the exact callback URL in the Angel One API app.
    - New Login authentication is handled by the documented login API.
      The old Publisher redirect flow is not used by this server. Current Angel One API-app rules can vary by app type.
-   - Production sessions are stored in Render Key Value through REDIS_URL.
-   - Local development can fall back to an in-memory store when REDIS_URL is absent.
+   - Sessions are kept in memory in this version. A persistent store
+     should be used before deploying multiple backend instances.
 ========================================================= */
 
 const SESSION_COOKIE = "ema360_session";
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const SESSION_TTL_SECONDS = Math.floor(SESSION_TTL_MS / 1000);
-const SESSION_KEY_PREFIX = "ema360:session:";
 
 /*
- * Production sessions live in Render Key Value (Redis/Valkey-compatible).
- * A small in-memory fallback is kept only for local development when
- * REDIS_URL is not configured.
- *
- * Angel JWT/feed/refresh tokens remain server-side and are never sent to
- * the browser or stored in localStorage.
+ * Each EMA360 browser session owns its own Angel One SmartAPI session.
+ * There is intentionally NO fixed client code, PIN or TOTP secret in .env.
  */
-const localAuthSessions = new Map();
-const REDIS_URL = String(process.env.REDIS_URL || "").trim();
-const isProduction = process.env.NODE_ENV === "production";
+const authSessions = new Map();
 
-if (isProduction && !REDIS_URL) {
-    console.error(
-        "❌ REDIS_URL is required in production. Create a Render Key Value instance and connect it to EMA360-backend."
-    );
+function timingSafeEqualText(a, b) {
+    const aa = Buffer.from(String(a));
+    const bb = Buffer.from(String(b));
+
+    if (aa.length !== bb.length) return false;
+    return crypto.timingSafeEqual(aa, bb);
 }
 
-const redis = REDIS_URL
-    ? new Redis(REDIS_URL, {
-        maxRetriesPerRequest: 3,
-        enableReadyCheck: true,
-        lazyConnect: false
-    })
-    : null;
+function parseCookies(header = "") {
+    const cookies = {};
 
-if (redis) {
-    redis.on("ready", () => {
-        console.log("🟢 EMA360 session store connected (Render Key Value)");
-    });
+    for (const part of String(header).split(";")) {
+        const index = part.indexOf("=");
+        if (index === -1) continue;
 
-    redis.on("error", (error) => {
-        console.error("❌ EMA360 session store error:", error?.message || error);
-    });
-}
-
-function sessionRedisKey(sessionId) {
-    return `${SESSION_KEY_PREFIX}${sessionId}`;
-}
-
-async function saveAuthSession(sessionId, session) {
-    if (redis) {
-        await redis.set(
-            sessionRedisKey(sessionId),
-            JSON.stringify(session),
-            "EX",
-            SESSION_TTL_SECONDS
-        );
-        return;
-    }
-
-    localAuthSessions.set(sessionId, session);
-}
-
-async function loadAuthSession(sessionId) {
-    if (redis) {
-        const raw = await redis.get(sessionRedisKey(sessionId));
-        if (!raw) return null;
+        const key = part.slice(0, index).trim();
+        const value = part.slice(index + 1).trim();
+        if (!key) continue;
 
         try {
-            return JSON.parse(raw);
-        } catch (error) {
-            console.error("❌ Invalid stored EMA360 session:", error);
-            await redis.del(sessionRedisKey(sessionId));
-            return null;
+            cookies[key] = decodeURIComponent(value);
+        } catch {
+            cookies[key] = value;
         }
     }
 
-    return localAuthSessions.get(sessionId) || null;
+    return cookies;
 }
 
-async function deleteAuthSession(sessionId) {
-    if (redis) {
-        await redis.del(sessionRedisKey(sessionId));
-        return;
+function cookieFlags(maxAgeSeconds) {
+    const isProduction =
+        process.env.NODE_ENV === "production";
+
+    if (isProduction) {
+        return `Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${maxAgeSeconds}`;
     }
 
-    localAuthSessions.delete(sessionId);
+    return `Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
 }
 
-async function getAuthenticatedSession(req) {
+function setAuthCookie(res, sessionId) {
+    res.setHeader(
+        "Set-Cookie",
+        `ema360_session=${encodeURIComponent(sessionId)}; ${cookieFlags(
+            Math.floor(SESSION_TTL_MS / 1000)
+        )}`
+    );
+}
+
+function clearAuthCookie(res) {
+    res.setHeader(
+        "Set-Cookie",
+        `ema360_session=; ${cookieFlags(0)}`
+    );
+}
+
+function getAuthenticatedSession(req) {
     const cookies = parseCookies(req.headers.cookie || "");
     const sessionId = cookies.ema360_session;
 
@@ -164,7 +197,10 @@ async function getAuthenticatedSession(req) {
         path: req.path,
         hasCookie: Boolean(sessionId),
         cookieLength: sessionId ? sessionId.length : 0,
-        sessionStore: redis ? "render-key-value" : "memory-local-dev",
+        sessionExists: sessionId
+            ? authSessions.has(sessionId)
+            : false,
+        activeSessions: authSessions.size,
         cfRay: req.headers["cf-ray"] || null
     });
 
@@ -173,22 +209,17 @@ async function getAuthenticatedSession(req) {
         return null;
     }
 
-    const session = await loadAuthSession(sessionId);
+    const session = authSessions.get(sessionId);
 
     if (!session) {
         console.log("❌ AUTH DEBUG: COOKIE EXISTS BUT SESSION NOT FOUND");
         return null;
     }
 
-    if (Date.now() > Number(session.expiresAt || 0)) {
+    if (Date.now() > session.expiresAt) {
         console.log("❌ AUTH DEBUG: SESSION EXPIRED");
-        await deleteAuthSession(sessionId);
+        authSessions.delete(sessionId);
         return null;
-    }
-
-    // Refresh the Redis TTL while the session is actively being used.
-    if (redis) {
-        await redis.expire(sessionRedisKey(sessionId), SESSION_TTL_SECONDS);
     }
 
     console.log(
@@ -247,7 +278,6 @@ app.post("/api/auth/angel/login", async (req, res) => {
         }
 
         console.log(`🔐 Angel One login attempt for client ${clientId}`);
-        console.log("📡 Sending Angel One authentication request...");
 
         const loginResponse = await axios.post(
             "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword",
@@ -270,13 +300,6 @@ app.post("/api/auth/angel/login", async (req, res) => {
         );
 
         const login = loginResponse.data;
-
-        console.log("📥 Angel One authentication response received:", {
-            status: login?.status,
-            message: login?.message || null,
-            hasJwtToken: Boolean(login?.data?.jwtToken),
-            hasFeedToken: Boolean(login?.data?.feedToken)
-        });
 
         if (!login?.status || !login?.data?.jwtToken) {
             console.error("❌ Angel One login rejected:", login);
@@ -323,35 +346,23 @@ app.post("/api/auth/angel/login", async (req, res) => {
 
         const sessionId = crypto.randomBytes(32).toString("hex");
 
-        const session = {
+        authSessions.set(sessionId, {
             user,
             jwtToken,
             refreshToken,
             feedToken,
             createdAt: Date.now(),
             expiresAt: Date.now() + SESSION_TTL_MS
-        };
+        });
 
-        await saveAuthSession(sessionId, session);
+        // Start this user's Angel One live feed.
+        await startAngelWebSocket(sessionId, authSessions.get(sessionId));
 
-        // IMPORTANT: do not wait for the Angel One WebSocket before
-        // replying to the browser. A WebSocket connection can take
-        // time or hang on Render, which would leave the frontend stuck
-        // on "Connecting" even though Angel authentication succeeded.
         setAuthCookie(res, sessionId);
 
         console.log(
-            `✅ Angel One authentication + session created for ${connectedClientId}`
+            `✅ Angel One login successful for ${connectedClientId}`
         );
-
-        // Start the live feed in the background. Historical API calls
-        // can already use the JWT stored in the server-side session.
-        startAngelWebSocket(sessionId, session).catch(error => {
-            console.error(
-                `❌ Background Angel One WebSocket start failed for ${connectedClientId}:`,
-                error?.message || error
-            );
-        });
 
         return res.json({
             success: true,
@@ -378,8 +389,8 @@ app.post("/api/auth/angel/login", async (req, res) => {
    CURRENT EMA360 SESSION
 ========================================================= */
 
-app.get("/api/auth/me", async (req, res) => {
-    const authenticated = await getAuthenticatedSession(req);
+app.get("/api/auth/me", (req, res) => {
+    const authenticated = getAuthenticatedSession(req);
 
     if (!authenticated) {
         return res.status(401).json({
@@ -401,7 +412,7 @@ app.get("/api/auth/me", async (req, res) => {
 ========================================================= */
 
 app.post("/api/auth/logout", async (req, res) => {
-    const authenticated = await getAuthenticatedSession(req);
+    const authenticated = getAuthenticatedSession(req);
 
     if (authenticated) {
         const { sessionId, session } = authenticated;
@@ -433,7 +444,7 @@ app.post("/api/auth/logout", async (req, res) => {
         }
 
         stopAngelWebSocket(sessionId);
-        await deleteAuthSession(sessionId);
+        authSessions.delete(sessionId);
     }
 
     clearAuthCookie(res);
@@ -444,6 +455,16 @@ app.post("/api/auth/logout", async (req, res) => {
     });
 });
 
+setInterval(() => {
+    const now = Date.now();
+
+    for (const [sessionId, session] of authSessions.entries()) {
+        if (now > session.expiresAt) {
+            stopAngelWebSocket(sessionId);
+            authSessions.delete(sessionId);
+        }
+    }
+}, 60 * 1000).unref();
 
 const clients = new Map();
 
@@ -1615,7 +1636,7 @@ app.get(
 
         try {
 
-            const authenticated = await getAuthenticatedSession(req);
+            const authenticated = getAuthenticatedSession(req);
 
             if (!authenticated?.session?.jwtToken) {
                 return res.status(401).json({
@@ -1755,7 +1776,7 @@ app.get(
 
 app.get(
     "/api/stream",
-    async (req, res) => {
+    (req, res) => {
 
         res.setHeader(
             "Content-Type",
@@ -1789,28 +1810,13 @@ app.get(
         );
 
 
-        const authenticated = await getAuthenticatedSession(req);
+        const authenticated = getAuthenticatedSession(req);
 
         if (!authenticated) {
             return res.status(401).end();
         }
 
         const sessionId = authenticated.sessionId;
-
-        // A Render restart clears process-local WebSocket state, but the
-        // authenticated session survives in Render Key Value. Reconnect the
-        // Angel feed when the browser opens the stream again.
-        if (!angelWebSockets.has(sessionId)) {
-            // Do not block the SSE connection while Angel One WebSocket
-            // reconnects. This is especially important on Render.
-            startAngelWebSocket(sessionId, authenticated.session).catch(error => {
-                console.error(
-                    "❌ Failed to restore Angel One live feed:",
-                    error?.message || error
-                );
-            });
-        }
-
         clients.set(res, sessionId);
 
         console.log(
@@ -3008,60 +3014,12 @@ function keepOnlyCompletedCandles(candles, timeframe) {
 // FETCH NSE CANDLES FOR SELECTED TIMEFRAME
 // ------------------------------------------------------------
 async function getNseCandles(symbol, timeframe = "5m", includeIncomplete = false) {
-    const normalizedSymbol = String(symbol || "")
-        .trim()
-        .toUpperCase();
-
-    // ------------------------------------------------------------
-    // NSE OFFICIAL MCP LIVE SNAPSHOT CANDLES
-    // ------------------------------------------------------------
-    // Render cannot reliably access NSE's public charting endpoints
-    // (they return 403). For intraday Guest Mode candles, use NSE's
-    // official MCP live quote and build OHLC candles from real snapshots.
-    // Do NOT silently use fake prices or another data provider.
-    // ------------------------------------------------------------
-    const intradayTimeframes = new Set([
-        "1m", "3m", "5m", "15m", "30m", "1h"
-    ]);
-
-    if (normalizedSymbol !== "NIFTY 50" && intradayTimeframes.has(timeframe)) {
-        try {
-            const candles = await nseMcpClient.getIntradayCandles(
-                normalizedSymbol,
-                timeframe
-            );
-
-            console.log(
-                "NSE MCP CANDLES:",
-                normalizedSymbol,
-                timeframe,
-                "candles =",
-                Array.isArray(candles) ? candles.length : 0
-            );
-
-            if (Array.isArray(candles) && candles.length) {
-                return normalizeMarketCandleShape(candles);
-            }
-        } catch (error) {
-            console.error(
-                `NSE MCP candle fetch failed for ${normalizedSymbol} ${timeframe}:`,
-                error?.stack || error?.message || error
-            );
-        }
-    }
-
-    // ------------------------------------------------------------
-    // DAILY CANDLES / LEGACY FALLBACK
-    // ------------------------------------------------------------
-    // Keep the existing NSE charting implementation for daily data.
-    // Intraday falls back here only if MCP did not return a candle.
-    // ------------------------------------------------------------
     try {
-        const token = await getNseToken(normalizedSymbol);
+        const token = await getNseToken(symbol);
 
         console.log(
             "DIAGNOSTIC TOKEN:",
-            normalizedSymbol,
+            symbol,
             "=>",
             token
         );
@@ -3069,57 +3027,135 @@ async function getNseCandles(symbol, timeframe = "5m", includeIncomplete = false
         if (!token) {
             console.log(
                 "❌ NO NSE TOKEN FOR:",
-                normalizedSymbol
+                symbol
             );
+
             return [];
         }
 
+        /*
+         * Large warm-up windows are intentional. Chartink calculates
+         * indicators from a historical intraday series; using only the
+         * latest 10 days can make EMA20 differ at the latest candle.
+         */
         const timeframeConfig = {
-            "1m": { interval: 1, days: 15 },
-            "3m": { interval: 3, days: 30 },
-            "5m": { interval: 5, days: 60 },
-            "15m": { interval: 15, days: 120 },
-            "30m": { interval: 30, days: 180 },
-            "1h": { interval: 60, days: 365 },
-            "1d": { interval: "D", days: 1000 }
+            "1m": {
+                interval: 1,
+                days: 15
+            },
+
+            "3m": {
+                interval: 3,
+                days: 30
+            },
+
+            "5m": {
+                interval: 5,
+                days: 60
+            },
+
+            "15m": {
+                interval: 15,
+                days: 120
+            },
+
+            "30m": {
+                interval: 30,
+                days: 180
+            },
+
+            "1h": {
+                interval: 60,
+                days: 365
+            },
+
+            "1d": {
+                interval: "D",
+                days: 1000
+            }
         };
 
         const config = timeframeConfig[timeframe];
+
         if (!config) {
-            throw new Error(`Unsupported NSE timeframe: ${timeframe}`);
+            throw new Error(
+                `Unsupported NSE timeframe: ${timeframe}`
+            );
         }
 
         const now = new Date();
+
         const start = new Date(
-            now.getTime() - config.days * 24 * 60 * 60 * 1000
+            now.getTime() -
+            config.days * 24 * 60 * 60 * 1000
         );
 
-        const response = await nseIndia.getEquityChartHistoricalData(
-            normalizedSymbol,
-            { start, end: now },
-            token,
-            "Equity",
-            "I",
-            config.interval
+        const response =
+            await nseIndia.getEquityChartHistoricalData(
+                symbol,
+                {
+                    start,
+                    end: now,
+                },
+                token,
+                "Equity",
+                "I",
+                config.interval
+            );
+
+        console.log(
+            "NSE RAW RESPONSE:",
+            symbol,
+            "type =",
+            Array.isArray(response)
+                ? "ARRAY"
+                : typeof response,
+            "length =",
+            Array.isArray(response)
+                ? response.length
+                : Array.isArray(response?.data)
+                    ? response.data.length
+                    : "NO DATA ARRAY"
         );
 
         const candles = normalizeNseCandles(response);
 
         console.log(
             "NSE NORMALIZED:",
-            normalizedSymbol,
+            symbol,
             "candles =",
             candles.length
         );
 
+        if (candles.length > 0) {
+            console.log(
+                "NSE FIRST CANDLE:",
+                candles[0]
+            );
+
+            console.log(
+                "NSE LAST CANDLE:",
+                candles[candles.length - 1]
+            );
+        }
+
+        // Normal scanner behavior:
+        // only completed candles are returned.
+        //
+        // Diagnostic mode:
+        // return the raw NSE series, including the latest
+        // possibly-incomplete candle.
         return includeIncomplete
             ? candles
             : keepOnlyCompletedCandles(candles, timeframe);
+
     } catch (error) {
+
         console.log(
-            `NSE ${timeframe} candle fetch failed for ${normalizedSymbol}:`,
-            error?.message || error
+            `NSE ${timeframe} candle fetch failed for ${symbol}:`,
+            error.message
         );
+
         return [];
     }
 }
@@ -4477,218 +4513,68 @@ async function getNseMarketCandles(symbol, timeframe = "5m") {
         .trim()
         .toUpperCase();
 
-    if (normalizedSymbol !== "NIFTY 50") {
-        // Guest Market Data must include the currently forming candle.
-        // The scanner continues to use completed candles separately.
-        const equityCandles =
-            await getNseCandles(
-                normalizedSymbol,
-                timeframe,
-                true
-            );
+    const tf = String(timeframe || "5m")
+        .trim()
+        .toLowerCase();
 
+    const intradayTimeframes = new Set([
+        "1m", "3m", "5m", "15m", "30m", "1h"
+    ]);
+
+    if (!intradayTimeframes.has(tf)) {
+        // Keep the existing NSE daily path for 1D only. Intraday guest
+        // market data is handled exclusively by the official NSE MCP below.
         return normalizeMarketCandleShape(
-            equityCandles
+            await getNseCandles(normalizedSymbol, tf, true)
         );
     }
 
-    /*
-     * NIFTY 50 is an NSE index, so it must not go through the
-     * equity-symbol/token lookup used for stocks.
-     *
-     * IMPORTANT FIX:
-     *
-     * getIndexIntradayData() returns a time/price graph, not OHLC candles.
-     * The old NSE guest implementation converted every point into:
-     *
-     *     O = H = L = C
-     *     V = 0
-     *
-     * That made the candlesticks invisible and produced bad RSI/ADX/EMA
-     * calculations. NSE's charting service supports historical OHLC data
-     * for Index symbols too, so use that first.
-     */
+    // NSE changed Tata Motors' current traded symbol to TMPV.
+    // EMA360 keeps TATAMOTORS as its UI symbol and translates only at the
+    // data boundary.
+    const mcpSymbol = normalizedSymbol === "TATAMOTORS"
+        ? "TMPV"
+        : normalizedSymbol;
 
-    const timeframeConfig = {
-        "1m": {
-            interval: 1,
-            days: 15
-        },
-        "3m": {
-            interval: 3,
-            days: 30
-        },
-        "5m": {
-            interval: 5,
-            days: 60
-        },
-        "15m": {
-            interval: 15,
-            days: 120
-        },
-        "30m": {
-            interval: 30,
-            days: 180
-        },
-        "1h": {
-            interval: 60,
-            days: 365
-        },
-        "1d": {
-            interval: "D",
-            days: 1000
-        }
-    };
-
-    const config = timeframeConfig[timeframe];
-
-    if (!config) {
-        throw new Error(
-            `Unsupported NSE NIFTY timeframe: ${timeframe}`
-        );
-    }
-
-    const now = new Date();
-
-    const start = new Date(
-        now.getTime() -
-        config.days * 24 * 60 * 60 * 1000
-    );
-
-    /*
-     * First choice: NSE charting OHLC for the index.
-     *
-     * stock-nse-india exposes the same charting endpoint through
-     * getEquityChartHistoricalData(), with symbolType = "Index".
-     */
     try {
-        // Let stock-nse-india resolve the charting symbol from NSE.
-        // The segment is optional; forcing IDX can return no token on
-        // versions where the index is exposed under the generic charting
-        // symbol lookup.
-        const symbolInfo =
-            await nseIndia.getEquitySymbolInfo(
-                "NIFTY 50"
-            );
-
-        const token =
-            symbolInfo?.scripcode ||
-            symbolInfo?.scripCode ||
-            symbolInfo?.token;
-
-        if (!token) {
-            throw new Error(
-                "NIFTY 50 charting token was not returned by NSE"
-            );
-        }
-
-        console.log(
-            "🇮🇳 NIFTY 50 NSE CHART TOKEN:",
-            token
-        );
-
-        const chartResponse =
-            await nseIndia.getEquityChartHistoricalData(
+        if (normalizedSymbol === "NIFTY 50") {
+            const candles = await nseMcpClient.getIndexIntradayCandles(
                 "NIFTY 50",
-                {
-                    start,
-                    end: now
-                },
-                token,
-                "Index",
-                timeframe === "1d" ? "D" : "I",
-                config.interval
+                tf
             );
 
-        const candles =
-            normalizeMarketCandleShape(
-                normalizeNseCandles(chartResponse)
+            console.log(
+                "🇮🇳 NSE MCP INDEX CANDLES:",
+                normalizedSymbol,
+                tf,
+                "candles =",
+                Array.isArray(candles) ? candles.length : 0
             );
+
+            return normalizeMarketCandleShape(candles || []);
+        }
+
+        const candles = await nseMcpClient.getIntradayCandles(
+            mcpSymbol,
+            tf
+        );
 
         console.log(
-            "🇮🇳 NIFTY 50 NSE INDEX OHLC:",
-            timeframe,
+            "🇮🇳 NSE MCP CANDLES:",
+            normalizedSymbol,
+            "->",
+            mcpSymbol,
+            tf,
             "candles =",
-            candles.length,
-            "last =",
-            candles.at(-1)
+            Array.isArray(candles) ? candles.length : 0
         );
 
-        if (candles.length) {
-            return candles;
-        }
-
-        throw new Error(
-            "NSE index charting returned no OHLC candles"
-        );
-
-    } catch (chartError) {
+        return normalizeMarketCandleShape(candles || []);
+    } catch (error) {
         console.error(
-            `⚠️ NIFTY 50 NSE charting OHLC failed for ${timeframe}:`,
-            chartError?.message || chartError
+            `❌ NSE MCP candle fetch failed for ${normalizedSymbol} (${mcpSymbol}) ${tf}:`,
+            error?.stack || error?.message || error
         );
-    }
-
-    /*
-     * Fallback 1: daily index history.
-     */
-    if (timeframe === "1d") {
-        try {
-            const historical =
-                await nseIndia.getIndexHistoricalData(
-                    "NIFTY 50",
-                    { start, end: now }
-                );
-
-            const candles =
-                normalizeMarketCandleShape(
-                    normalizeNseIndexHistorical(historical)
-                );
-
-            if (candles.length) {
-                return candles;
-            }
-        } catch (historicalError) {
-            console.error(
-                "⚠️ NIFTY 50 NSE daily fallback failed:",
-                historicalError?.message || historicalError
-            );
-        }
-    }
-
-    /*
-     * Fallback 2: current-day index graph.
-     *
-     * This fallback is deliberately used only when charting OHLC is
-     * unavailable. We aggregate the real NSE price points into OHLC candles
-     * instead of creating zero-height O=H=L=C candles.
-     *
-     * NIFTY spot index data does not provide traded candle volume here, so
-     * volume remains 0 rather than inventing fake volume.
-     */
-    try {
-        const intraday =
-            await nseIndia.getIndexIntradayData(
-                "NIFTY 50"
-            );
-
-        const graph =
-            intraday?.grapthData ||
-            intraday?.graphData ||
-            [];
-
-        return normalizeMarketCandleShape(
-            normalizeNseIndexIntradayCandles(
-                graph,
-                timeframe
-            )
-        );
-    } catch (intradayError) {
-        console.error(
-            "❌ NIFTY 50 NSE intraday fallback failed:",
-            intradayError?.message || intradayError
-        );
-
         return [];
     }
 }
@@ -4719,15 +4605,15 @@ function nseWebHeaders(symbol) {
 }
 
 async function fetchNseMarketQuote(symbol) {
-    const normalizedSymbol = String(symbol || "")
+    const requestedSymbol = String(symbol || "")
         .trim()
         .toUpperCase();
 
-    if (!normalizedSymbol) {
+    if (!requestedSymbol) {
         throw new Error("Symbol is required");
     }
 
-    const cached = NSE_MARKET_QUOTE_CACHE.get(normalizedSymbol);
+    const cached = NSE_MARKET_QUOTE_CACHE.get(requestedSymbol);
     if (
         cached &&
         Date.now() - cached.timestamp < NSE_MARKET_QUOTE_CACHE_MS
@@ -4735,94 +4621,48 @@ async function fetchNseMarketQuote(symbol) {
         return cached.data;
     }
 
-    const existing = NSE_MARKET_QUOTE_INFLIGHT.get(normalizedSymbol);
-    if (existing) {
-        return existing;
-    }
+    const existing = NSE_MARKET_QUOTE_INFLIGHT.get(requestedSymbol);
+    if (existing) return existing;
 
     const request = (async () => {
         try {
             let result;
 
-            if (normalizedSymbol === "NIFTY 50") {
-                // This package method uses NSE's index endpoint and handles
-                // the NSE session/cookie flow for us.
-                const indexData =
-                    await nseIndia.getEquityStockIndices("NIFTY 50");
-
-                const meta = indexData?.metadata || {};
-                const price = Number(meta.last);
-                const previousClose = Number(meta.previousClose);
+            if (requestedSymbol === "NIFTY 50") {
+                const details = await nseMcpClient.getIndexIntradayData("NIFTY 50");
+                const price = Number(details?.price);
+                const previousClose = Number(details?.previousClose);
+                const change = Number(details?.change);
 
                 if (!Number.isFinite(price) || price <= 0) {
-                    throw new Error(
-                        "NSE NIFTY 50 current price was not returned"
-                    );
+                    throw new Error("NSE MCP did not return NIFTY 50 price");
                 }
-
-                const change =
-                    Number.isFinite(previousClose) && previousClose > 0
-                        ? ((price - previousClose) / previousClose) * 100
-                        : Number(meta.percChange);
 
                 result = {
                     source: "NSE",
-                    symbol: normalizedSymbol,
+                    symbol: requestedSymbol,
                     price,
-                    previousClose:
-                        Number.isFinite(previousClose)
-                            ? previousClose
-                            : null,
-                    change:
-                        Number.isFinite(change)
-                            ? change
-                            : null,
-                    // NIFTY spot is an index, not a traded share/security.
-                    // Do not feed aggregate index volume into candle volume.
+                    previousClose: Number.isFinite(previousClose) ? previousClose : null,
+                    change: Number.isFinite(change) ? change : null,
                     volume: null,
-                    open: Number(meta.open) || null,
-                    high: Number(meta.high) || null,
-                    low: Number(meta.low) || null,
-                    timestamp: new Date().toISOString()
+                    open: Number.isFinite(Number(details?.open)) ? Number(details.open) : null,
+                    high: Number.isFinite(Number(details?.high)) ? Number(details.high) : null,
+                    low: Number.isFinite(Number(details?.low)) ? Number(details.low) : null,
+                    timestamp: details?.timestamp || new Date().toISOString()
                 };
             } else {
-                const details =
-                    await nseIndia.getEquityDetails(
-                        normalizedSymbol
-                    );
+                const nseSymbol = requestedSymbol === "TATAMOTORS"
+                    ? "TMPV"
+                    : requestedSymbol;
 
+                const details = await nseMcpClient.getEquityDetails(nseSymbol);
                 const priceInfo = details?.priceInfo || {};
-
-                let totalVolume = null;
-
-                try {
-                    const tradeInfo =
-                        await nseIndia.getEquityTradeInfo(
-                            normalizedSymbol
-                        );
-
-                    const value = Number(
-                        tradeInfo?.marketDeptOrderBook
-                            ?.tradeInfo
-                            ?.totalTradedVolume
-                    );
-
-                    if (Number.isFinite(value)) {
-                        totalVolume = value;
-                    }
-                } catch (volumeError) {
-                    console.warn(
-                        `⚠️ NSE volume unavailable for ${normalizedSymbol}:`,
-                        volumeError?.message || volumeError
-                    );
-                }
-
                 const price = Number(priceInfo.lastPrice);
                 const previousClose = Number(priceInfo.previousClose);
 
                 if (!Number.isFinite(price) || price <= 0) {
                     throw new Error(
-                        `NSE current price was not returned for ${normalizedSymbol}`
+                        `NSE MCP did not return current price for ${requestedSymbol} (${nseSymbol})`
                     );
                 }
 
@@ -4831,19 +4671,22 @@ async function fetchNseMarketQuote(symbol) {
                         ? ((price - previousClose) / previousClose) * 100
                         : Number(priceInfo.pChange);
 
+                const raw = details?.raw || {};
+                const volume = [
+                    raw?.totalTradedVolume,
+                    raw?.totalTradedQty,
+                    raw?.tradedVolume,
+                    raw?.volume
+                ].map(Number).find(Number.isFinite);
+
                 result = {
                     source: "NSE",
-                    symbol: normalizedSymbol,
+                    symbol: requestedSymbol,
+                    nseSymbol,
                     price,
-                    previousClose:
-                        Number.isFinite(previousClose)
-                            ? previousClose
-                            : null,
-                    change:
-                        Number.isFinite(change)
-                            ? change
-                            : null,
-                    volume: totalVolume,
+                    previousClose: Number.isFinite(previousClose) ? previousClose : null,
+                    change: Number.isFinite(change) ? change : null,
+                    volume: Number.isFinite(volume) ? volume : null,
                     open: Number(priceInfo.open) || null,
                     high: Number(priceInfo.intraDayHighLow?.max) || null,
                     low: Number(priceInfo.intraDayHighLow?.min) || null,
@@ -4852,18 +4695,18 @@ async function fetchNseMarketQuote(symbol) {
                 };
             }
 
-            NSE_MARKET_QUOTE_CACHE.set(normalizedSymbol, {
+            NSE_MARKET_QUOTE_CACHE.set(requestedSymbol, {
                 timestamp: Date.now(),
                 data: result
             });
 
             return result;
         } finally {
-            NSE_MARKET_QUOTE_INFLIGHT.delete(normalizedSymbol);
+            NSE_MARKET_QUOTE_INFLIGHT.delete(requestedSymbol);
         }
     })();
 
-    NSE_MARKET_QUOTE_INFLIGHT.set(normalizedSymbol, request);
+    NSE_MARKET_QUOTE_INFLIGHT.set(requestedSymbol, request);
     return request;
 }
 
@@ -4963,64 +4806,57 @@ async function fetchNseNifty50Quotes() {
 
     if (
         NSE_NIFTY50_QUOTES_CACHE.timestamp &&
-        now - NSE_NIFTY50_QUOTES_CACHE.timestamp < 1500 &&
+        now - NSE_NIFTY50_QUOTES_CACHE.timestamp < 10000 &&
         Object.keys(NSE_NIFTY50_QUOTES_CACHE.quotes).length
     ) {
         return NSE_NIFTY50_QUOTES_CACHE.quotes;
     }
 
-    const indexData =
-        await nseIndia.getEquityStockIndices(
-            NSE_NIFTY50_QUOTES_CACHE_KEY
-        );
+    // The old implementation used stock-nse-india's bulk endpoint. That
+    // endpoint is the one returning 403 on Render. Use the official NSE MCP
+    // individual quote tool instead. Keep this deliberately small and
+    // cached; the selected-stock quote route remains the primary live path.
+    const symbols = [
+        "RELIANCE",
+        "HDFCBANK",
+        "ICICIBANK",
+        "INFY",
+        "TCS",
+        "SBIN",
+        "BHARTIARTL",
+        "ITC",
+        "LT",
+        "TATAMOTORS"
+    ];
 
-    const quotes =
-        normalizeNseIndexConstituentRows(indexData);
+    const quotes = {};
 
-    // RELIANCE is a NIFTY 50 constituent. If the bulk NSE snapshot
-    // omits it for a transient response-format/API issue, recover it
-    // from the dedicated NSE equity quote endpoint instead of leaving
-    // the dashboard card blank. This is intentionally limited to a
-    // missing symbol so normal market-wide polling is not multiplied
-    // into 50 individual requests.
-    if (!quotes.RELIANCE) {
+    for (const symbol of symbols) {
         try {
-            const relianceQuote = await fetchNseMarketQuote("RELIANCE");
-            if (relianceQuote) {
-                quotes.RELIANCE = relianceQuote;
+            const quote = await fetchNseMarketQuote(symbol);
+            if (quote && Number.isFinite(Number(quote.price))) {
+                quotes[symbol] = quote;
             }
         } catch (error) {
             console.warn(
-                "⚠️ NSE RELIANCE fallback quote unavailable:",
+                `⚠️ NSE MCP constituent quote unavailable for ${symbol}:`,
                 error?.message || error
             );
         }
     }
 
-    /*
-       The constituent endpoint returns the 50 stocks, but the
-       selected dashboard can also be NIFTY 50 itself.  NIFTY 50
-       is an index, so fetch its own NSE quote separately and keep
-       it in the same snapshot.  This makes the large selected-stock
-       header update automatically instead of waiting for a click.
-    */
     try {
         const niftyQuote = await fetchNseMarketQuote("NIFTY 50");
-        if (niftyQuote) {
-            quotes["NIFTY 50"] = niftyQuote;
-        }
+        if (niftyQuote) quotes["NIFTY 50"] = niftyQuote;
     } catch (error) {
         console.warn(
-            "⚠️ NSE NIFTY 50 index quote unavailable during constituent poll:",
+            "⚠️ NSE MCP NIFTY 50 quote unavailable:",
             error?.message || error
         );
     }
 
-    // Keep a partial response rather than fabricating missing prices.
     if (!Object.keys(quotes).length) {
-        throw new Error(
-            "NSE NIFTY 50 constituent prices were not returned"
-        );
+        throw new Error("NSE MCP returned no constituent quotes");
     }
 
     NSE_NIFTY50_QUOTES_CACHE = {
@@ -5133,6 +4969,85 @@ let NSE_HEADER_INDICES_CACHE = {
     indices: {}
 };
 
+let NSE_ALL_INDICES_CACHE = {
+    timestamp: 0,
+    data: null
+};
+
+const NSE_ALL_INDICES_CACHE_MS = 5000;
+
+async function fetchNseAllIndices() {
+    const now = Date.now();
+
+    if (
+        NSE_ALL_INDICES_CACHE.data &&
+        now - NSE_ALL_INDICES_CACHE.timestamp < NSE_ALL_INDICES_CACHE_MS
+    ) {
+        return NSE_ALL_INDICES_CACHE.data;
+    }
+
+    const data = await nseIndia.getAllIndices();
+
+    NSE_ALL_INDICES_CACHE = {
+        timestamp: Date.now(),
+        data
+    };
+
+    return data;
+}
+
+function findNseIndexMeta(payload, aliases) {
+    const rows = Array.isArray(payload?.data)
+        ? payload.data
+        : Array.isArray(payload)
+            ? payload
+            : [];
+
+    const wanted = aliases.map(value => String(value).trim().toUpperCase());
+
+    const row = rows.find(item => {
+        const name = String(
+            item?.index ||
+            item?.indexSymbol ||
+            item?.name ||
+            ""
+        ).trim().toUpperCase();
+
+        return wanted.includes(name);
+    });
+
+    return row || null;
+}
+
+function findMcpQuoteObject(value, depth = 0) {
+    if (depth > 8 || value == null) return null;
+
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const found = findMcpQuoteObject(item, depth + 1);
+            if (found) return found;
+        }
+        return null;
+    }
+
+    if (typeof value !== "object") return null;
+
+    const priceKeys = [
+        "lastPrice", "ltp", "last", "indexValue", "currentValue", "value", "close"
+    ];
+
+    if (priceKeys.some(key => value[key] !== undefined && value[key] !== null)) {
+        return value;
+    }
+
+    for (const item of Object.values(value)) {
+        const found = findMcpQuoteObject(item, depth + 1);
+        if (found) return found;
+    }
+
+    return null;
+}
+
 async function fetchNseHeaderIndices() {
     const now = Date.now();
 
@@ -5144,16 +5059,6 @@ async function fetchNseHeaderIndices() {
         return NSE_HEADER_INDICES_CACHE.indices;
     }
 
-    /*
-       stock-nse-india v1.4 exposes getEquityStockIndices(index)
-       for a specific NSE index.  Calling it without an index is not
-       a reliable way to obtain the complete ticker set, which is why
-       only NIFTY 50 was appearing before.
-
-       Fetch the exact NSE indices used by EMA360 and normalize their
-       metadata. SENSEX is intentionally excluded because it belongs
-       to BSE, not NSE.
-    */
     const indexNames = [
         ["BANKNIFTY", "NIFTY BANK"],
         ["FINNIFTY", "NIFTY FIN SERVICE"],
@@ -5165,91 +5070,75 @@ async function fetchNseHeaderIndices() {
         ["NIFTYSMALL100", "NIFTY SMLCAP 100"]
     ];
 
-    const entries = await Promise.all(
-        indexNames.map(async ([label, nseIndexName]) => {
-            try {
-                const indexData =
-                    await nseIndia.getEquityStockIndices(nseIndexName);
-
-                const meta = indexData?.metadata || {};
-                const price = pickNumber(
-                    meta.last,
-                    meta.lastPrice,
-                    meta.ltp,
-                    meta.close
-                );
-
-                if (!Number.isFinite(price)) {
-                    return [label, null];
-                }
-
-                const previousClose = pickNumber(
-                    meta.previousClose,
-                    meta.prevClose
-                );
-
-                const change =
-                    Number.isFinite(previousClose) && previousClose > 0
-                        ? ((price - previousClose) / previousClose) * 100
-                        : pickNumber(meta.percChange, meta.pChange);
-
-                return [
-                    label,
-                    {
-                        source: "NSE",
-                        name: label,
-                        price,
-                        previousClose,
-                        change: Number.isFinite(change) ? change : null,
-                        timestamp: new Date().toISOString()
-                    }
-                ];
-            } catch (error) {
-                console.warn(
-                    `⚠️ NSE header index ${nseIndexName} failed:`,
-                    error?.message || error
-                );
-                return [label, null];
-            }
-        })
-    );
-
     const output = {};
 
-    for (const [label, value] of entries) {
-        if (value) {
-            output[label] = value;
+    for (const [label, nseName] of indexNames) {
+        try {
+            const payload = await nseMcpClient.callLiveMarket(nseName);
+            const row = findMcpQuoteObject(payload);
+            if (!row) continue;
+
+            const price = pickNumber(
+                row?.lastPrice,
+                row?.ltp,
+                row?.last,
+                row?.indexValue,
+                row?.currentValue,
+                row?.value,
+                row?.close
+            );
+
+            if (!Number.isFinite(price)) continue;
+
+            const previousClose = pickNumber(
+                row?.previousClose,
+                row?.prevClose,
+                row?.previous_close
+            );
+
+            const change =
+                Number.isFinite(previousClose) && previousClose > 0
+                    ? ((price - previousClose) / previousClose) * 100
+                    : pickNumber(row?.pChange, row?.percentChange, row?.percChange);
+
+            output[label] = {
+                source: "NSE",
+                name: label,
+                price,
+                previousClose: Number.isFinite(previousClose) ? previousClose : null,
+                change: Number.isFinite(change) ? change : null,
+                timestamp: new Date().toISOString()
+            };
+        } catch (error) {
+            console.warn(
+                `⚠️ NSE MCP header index failed for ${label}:`,
+                error?.message || error
+            );
         }
     }
 
-    /*
-       RELIANCE replaces SENSEX in the EMA360 header.
-       RELIANCE is an NSE equity, so it cannot be obtained from
-       getEquityStockIndices(). Fetch its live NSE equity quote and
-       expose it through the SAME marketIndices object used by Header.
-    */
+    // EMA360's former SENSEX slot is now RELIANCE in NSE-only mode.
     try {
-        const relianceQuote = await fetchNseMarketQuote("RELIANCE");
-
-        if (relianceQuote && Number.isFinite(Number(relianceQuote.price))) {
-            output["RELIANCE"] = {
+        const reliance = await fetchNseMarketQuote("RELIANCE");
+        if (reliance) {
+            output.RELIANCE = {
                 source: "NSE",
                 name: "RELIANCE",
-                price: Number(relianceQuote.price),
-                previousClose: Number.isFinite(Number(relianceQuote.previousClose))
-                    ? Number(relianceQuote.previousClose)
-                    : null,
-                change: Number.isFinite(Number(relianceQuote.change))
-                    ? Number(relianceQuote.change)
-                    : null,
-                timestamp: relianceQuote.timestamp || new Date().toISOString()
+                price: reliance.price,
+                previousClose: reliance.previousClose,
+                change: reliance.change,
+                timestamp: reliance.timestamp
             };
         }
     } catch (error) {
         console.warn(
-            "⚠️ NSE header RELIANCE quote failed:",
+            "⚠️ NSE MCP header RELIANCE quote failed:",
             error?.message || error
         );
+    }
+
+    if (!Object.keys(output).length) {
+        throw new Error("NSE MCP returned no header index data");
     }
 
     NSE_HEADER_INDICES_CACHE = {
@@ -6343,12 +6232,6 @@ const PORT =
 async function startServer() {
 
     try {
-
-        if (isProduction && !REDIS_URL) {
-            throw new Error(
-                "REDIS_URL is missing. Connect EMA360-backend to a Render Key Value instance before starting production."
-            );
-        }
 
         /* Instrument master is public metadata and does not require a fixed user login. */
         await loadInstrumentMaster();
