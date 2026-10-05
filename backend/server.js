@@ -5,62 +5,18 @@ const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
 
-const { NseIndia } = require("stock-nse-india");
+const { NseMcpClient } = require("./nseMcpClient");
 
 /*
- * IMPORTANT NSE PRODUCTION CONTROL
- * --------------------------------
- * Render was previously opening many NSE requests at the same time.
- * That is especially bad for NSE/Akamai-protected endpoints.
+ * OFFICIAL NSE DATA TRANSPORT
+ * ---------------------------
+ * Guest/NSE mode now uses NSE's official no-auth CM Market MCP service
+ * instead of scraping nseindia.com through stock-nse-india.
  *
- * Keep ONE NseIndia instance and serialize every NSE SDK call through a
- * small queue. This does not bypass NSE protection; it simply prevents EMA360
- * from creating request bursts. A 403 is never retried aggressively.
+ * NSE states that CM Market Live is approximately 1-3 minutes behind
+ * real-time and is intended for educational/informational use.
  */
-const rawNseIndia = new NseIndia();
-
-const NSE_QUEUE_MIN_GAP_MS = Math.max(500, Number(process.env.NSE_QUEUE_MIN_GAP_MS || 1200));
-let nseQueue = Promise.resolve();
-let nseLastRequestAt = 0;
-
-function queueNseCall(label, fn) {
-    const run = nseQueue.then(async () => {
-        const wait = Math.max(0, NSE_QUEUE_MIN_GAP_MS - (Date.now() - nseLastRequestAt));
-        if (wait > 0) {
-            await new Promise(resolve => setTimeout(resolve, wait));
-        }
-
-        nseLastRequestAt = Date.now();
-
-        try {
-            return await fn();
-        } catch (error) {
-            const status = error?.response?.status || error?.status || "";
-            if (String(status) === "403" || /403/.test(String(error?.message || ""))) {
-                console.error(`❌ NSE 403 (${label}). No aggressive retry will be attempted.`);
-            }
-            throw error;
-        }
-    });
-
-    // Keep the queue alive after a failed request.
-    nseQueue = run.catch(() => undefined);
-    return run;
-}
-
-// Proxy all SDK methods so existing EMA360 code automatically uses the queue.
-const nseIndia = new Proxy(rawNseIndia, {
-    get(target, property, receiver) {
-        const value = Reflect.get(target, property, receiver);
-
-        if (typeof value !== "function") {
-            return value;
-        }
-
-        return (...args) =>
-            queueNseCall(String(property), () => value.apply(target, args));
-    }
-});
+const nseIndia = new NseMcpClient();
 
 // Cache NSE symbols and tokens so we don't repeatedly fetch them
 let NSE_STOCKS_CACHE = [];
@@ -3013,147 +2969,20 @@ function keepOnlyCompletedCandles(candles, timeframe) {
 // ------------------------------------------------------------
 async function getNseCandles(symbol, timeframe = "5m", includeIncomplete = false) {
     try {
-        const token = await getNseToken(symbol);
-
-        console.log(
-            "DIAGNOSTIC TOKEN:",
-            symbol,
-            "=>",
-            token
-        );
-
-        if (!token) {
-            console.log(
-                "❌ NO NSE TOKEN FOR:",
-                symbol
-            );
-
-            return [];
+        if (timeframe === "1d") {
+            const today = new Date();
+            const start = new Date(today.getTime() - 1000 * 24 * 60 * 60 * 1000);
+            const response = await nseIndia.getEquityHistoricalData(symbol, { start, end: today });
+            const rows = Array.isArray(response)
+                ? response.flatMap(item => Array.isArray(item?.data) ? item.data : [])
+                : Array.isArray(response?.data) ? response.data : [];
+            return normalizeNseCandles(rows);
         }
 
-        /*
-         * Large warm-up windows are intentional. Chartink calculates
-         * indicators from a historical intraday series; using only the
-         * latest 10 days can make EMA20 differ at the latest candle.
-         */
-        const timeframeConfig = {
-            "1m": {
-                interval: 1,
-                days: 15
-            },
-
-            "3m": {
-                interval: 3,
-                days: 30
-            },
-
-            "5m": {
-                interval: 5,
-                days: 60
-            },
-
-            "15m": {
-                interval: 15,
-                days: 120
-            },
-
-            "30m": {
-                interval: 30,
-                days: 180
-            },
-
-            "1h": {
-                interval: 60,
-                days: 365
-            },
-
-            "1d": {
-                interval: "D",
-                days: 1000
-            }
-        };
-
-        const config = timeframeConfig[timeframe];
-
-        if (!config) {
-            throw new Error(
-                `Unsupported NSE timeframe: ${timeframe}`
-            );
-        }
-
-        const now = new Date();
-
-        const start = new Date(
-            now.getTime() -
-            config.days * 24 * 60 * 60 * 1000
-        );
-
-        const response =
-            await nseIndia.getEquityChartHistoricalData(
-                symbol,
-                {
-                    start,
-                    end: now,
-                },
-                token,
-                "Equity",
-                "I",
-                config.interval
-            );
-
-        console.log(
-            "NSE RAW RESPONSE:",
-            symbol,
-            "type =",
-            Array.isArray(response)
-                ? "ARRAY"
-                : typeof response,
-            "length =",
-            Array.isArray(response)
-                ? response.length
-                : Array.isArray(response?.data)
-                    ? response.data.length
-                    : "NO DATA ARRAY"
-        );
-
-        const candles = normalizeNseCandles(response);
-
-        console.log(
-            "NSE NORMALIZED:",
-            symbol,
-            "candles =",
-            candles.length
-        );
-
-        if (candles.length > 0) {
-            console.log(
-                "NSE FIRST CANDLE:",
-                candles[0]
-            );
-
-            console.log(
-                "NSE LAST CANDLE:",
-                candles[candles.length - 1]
-            );
-        }
-
-        // Normal scanner behavior:
-        // only completed candles are returned.
-        //
-        // Diagnostic mode:
-        // return the raw NSE series, including the latest
-        // possibly-incomplete candle.
-        return includeIncomplete
-            ? candles
-            : keepOnlyCompletedCandles(candles, timeframe);
-
+        const candles = await nseIndia.getIntradayCandles(symbol, timeframe);
+        return includeIncomplete ? candles : keepOnlyCompletedCandles(candles, timeframe);
     } catch (error) {
-
-        console.log(
-            `NSE ${timeframe} candle fetch failed for ${symbol}:`,
-            error.message
-        );
-
+        console.log(`NSE ${timeframe} candle fetch failed for ${symbol}:`, error.message);
         return [];
     }
 }
