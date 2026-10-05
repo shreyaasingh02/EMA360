@@ -104,31 +104,7 @@ function useMarketData(dataSource = "angel") {
     // Calculation logic is NOT changed here.
     // =========================================================
 
-    useEffect(() => {
-
-        console.log(
-            `🔄 DATA SOURCE CHANGED → ${activeSource.toUpperCase()}`
-        );
-
-        // Clear candle cache
-        stockDataRef.current = {};
-
-        // Clear React stock data
-        setStockData({});
-
-        // Clear currently displayed candles
-        setCandles([]);
-
-        // Reset previous price
-        setPreviousPrice(0);
-
-        // Clear live market quote cache
-        setMarketQuotes({});
-
-        // Force dependent components to refresh
-        setDataVersion(previous => previous + 1);
-
-    }, [activeSource]);
+    
 
     /* =========================================================
        SELECTION REQUEST ID
