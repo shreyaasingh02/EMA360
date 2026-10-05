@@ -1556,89 +1556,41 @@ class NseMcpClient {
 
 
 
-  async getIndexIntradayData(indexName) {
+  async getIndexIntradayData(symbol) {
+    const indexName = String(symbol || "").trim().toUpperCase();
+    const data = await this.callLiveMarket(indexName);
+    const row = firstQuoteObject(data) || {};
 
-    const name = String(indexName || "")
-        .trim()
-        .toUpperCase();
+    const price = quoteNumber(row, "lastPrice", "ltp", "last", "indexValue", "currentValue", "value", "close");
+    const previousClose = quoteNumber(row, "previousClose", "prevClose", "previous_close");
+    const change = Number.isFinite(previousClose) && previousClose > 0 && Number.isFinite(price)
+      ? ((price - previousClose) / previousClose) * 100
+      : quoteNumber(row, "pChange", "percentChange", "percChange");
+    const open = quoteNumber(row, "open");
+    const high = quoteNumber(row, "dayHigh", "high");
+    const low = quoteNumber(row, "dayLow", "low");
+    const now = Date.now();
+    const storeKey = `INDEX:${indexName}`;
 
-    if (!name) {
-        throw new Error("Index name is required");
+    if (Number.isFinite(price) && price > 0) {
+      await this.loadSnapshots(storeKey);
+      const previousSample = this.lastSampleAt.get(storeKey) || 0;
+      if (now - previousSample >= NSE_SAMPLE_MIN_GAP_MS) {
+        this.lastSampleAt.set(storeKey, now);
+        const list = this.snapshotStore.get(storeKey) || [];
+        list.push({ time: now, c: price, v: 0 });
+        const cutoff = now - 7 * 24 * 60 * 60 * 1000;
+        this.snapshotStore.set(storeKey, list.filter(point => Number(point.time) >= cutoff).slice(-5000));
+        this.saveSnapshots(storeKey).catch(() => undefined);
+      }
     }
-
-    const data = await this.callLiveMarket(name);
-
-    const rows = extractRows(data);
-
-    if (!rows.length) {
-        throw new Error(
-            `No live NSE index data returned for ${name}`
-        );
-    }
-
-    // Try to find the actual requested index row.
-    const indexRow =
-        rows.find(row => {
-
-            const rowName = String(
-                row?.index ??
-                row?.indexSymbol ??
-                row?.name ??
-                row?.symbol ??
-                ""
-            )
-                .trim()
-                .toUpperCase();
-
-            return (
-                rowName === name ||
-                rowName.includes(name) ||
-                name.includes(rowName)
-            );
-
-        }) || rows[0];
-
-    const price = Number(
-        indexRow?.lastPrice ??
-        indexRow?.ltp ??
-        indexRow?.last ??
-        indexRow?.close ??
-        indexRow?.indexValue ??
-        indexRow?.currentValue
-    );
-
-    const previousClose = Number(
-        indexRow?.previousClose ??
-        indexRow?.prevClose ??
-        indexRow?.previous_close
-    );
-
-    const change = Number(
-        indexRow?.change ??
-        indexRow?.changeValue
-    );
-
-    const changePercent = Number(
-        indexRow?.pChange ??
-        indexRow?.changePercent ??
-        indexRow?.percentChange
-    );
 
     return {
-        index: name,
-        price: Number.isFinite(price) ? price : null,
-        previousClose: Number.isFinite(previousClose)
-            ? previousClose
-            : null,
-        change: Number.isFinite(change)
-            ? change
-            : null,
-        changePercent: Number.isFinite(changePercent)
-            ? changePercent
-            : null,
-        timestamp: new Date().toISOString()
+      grapthData: Number.isFinite(price) ? [[Math.floor(now / 1000), price]] : [],
+      price, previousClose, change, open, high, low,
+      timestamp: new Date(now).toISOString(), raw: row
     };
-}
+  }
 
   async getIndexIntradayCandles(symbol, timeframe = "5m") {
     const indexName = String(symbol || "").trim().toUpperCase();
@@ -1667,171 +1619,6 @@ class NseMcpClient {
     return Array.from(buckets.values()).sort((a,b)=>new Date(a.time)-new Date(b.time));
   }
 
-
-  async getIndexIntradayCandles(indexName, timeframe = "5m") {
-
-    const key = String(indexName || "")
-        .trim()
-        .toUpperCase();
-
-    const minutes = {
-        "1m": 1,
-        "3m": 3,
-        "5m": 5,
-        "15m": 15,
-        "30m": 30,
-        "1h": 60
-    }[timeframe];
-
-    if (!minutes) {
-        throw new Error(
-            `Unsupported NSE index timeframe: ${timeframe}`
-        );
-    }
-
-    /*
-     * ---------------------------------------------------------
-     * INDEX SNAPSHOT STORE
-     * ---------------------------------------------------------
-     *
-     * We keep index snapshots separately from equity snapshots.
-     * NIFTY 50 is an INDEX, so it must never go through the
-     * equity getIntradayCandles() path.
-     */
-
-    if (!this.indexSnapshotStore) {
-        this.indexSnapshotStore = new Map();
-    }
-
-    if (!this.indexLastSampleAt) {
-        this.indexLastSampleAt = new Map();
-    }
-
-    const lastSample =
-        this.indexLastSampleAt.get(key) || 0;
-
-    /*
-     * Take a fresh official NSE live index snapshot.
-     */
-    if (
-        Date.now() - lastSample >=
-        NSE_SAMPLE_MIN_GAP_MS
-    ) {
-
-        const details =
-            await this.getIndexIntradayData(key);
-
-        const price = Number(details?.price);
-
-        if (Number.isFinite(price) && price > 0) {
-
-            const list =
-                this.indexSnapshotStore.get(key) || [];
-
-            list.push({
-                time: Date.now(),
-                c: price,
-                v: 0
-            });
-
-            const cutoff =
-                Date.now() -
-                7 * 24 * 60 * 60 * 1000;
-
-            const trimmed =
-                list
-                    .filter(
-                        point =>
-                            Number(point.time) >= cutoff
-                    )
-                    .slice(-5000);
-
-            this.indexSnapshotStore.set(
-                key,
-                trimmed
-            );
-
-            this.indexLastSampleAt.set(
-                key,
-                Date.now()
-            );
-        }
-    }
-
-    const snapshots =
-        this.indexSnapshotStore.get(key) || [];
-
-    const buckets = new Map();
-
-    for (const point of snapshots) {
-
-        const timestamp =
-            Number(point.time);
-
-        const price =
-            Number(point.c);
-
-        if (
-            !Number.isFinite(timestamp) ||
-            !Number.isFinite(price)
-        ) {
-            continue;
-        }
-
-        const bucket =
-            Math.floor(
-                timestamp /
-                (minutes * 60 * 1000)
-            ) *
-            (minutes * 60 * 1000);
-
-        let candle =
-            buckets.get(bucket);
-
-        if (!candle) {
-
-            candle = {
-                time:
-                    new Date(bucket).toISOString(),
-
-                o: price,
-                h: price,
-                l: price,
-                c: price,
-                v: 0
-            };
-
-            buckets.set(
-                bucket,
-                candle
-            );
-
-        } else {
-
-            candle.h =
-                Math.max(
-                    Number(candle.h),
-                    price
-                );
-
-            candle.l =
-                Math.min(
-                    Number(candle.l),
-                    price
-                );
-
-            candle.c = price;
-        }
-    }
-
-    return Array.from(
-        buckets.values()
-    ).sort(
-        (a, b) =>
-            new Date(a.time) -
-            new Date(b.time)
-    );
-}
 }
 
 
