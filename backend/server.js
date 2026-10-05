@@ -793,7 +793,7 @@ async function startAngelWebSocket(sessionId, session) {
     /* Close an older socket for the same EMA360 session, if any. */
     const existing = angelWebSockets.get(sessionId);
     if (existing) {
-        try { existing.close(); } catch (_) {}
+        try { existing.close(); } catch (_) { }
         angelWebSockets.delete(sessionId);
     }
 
@@ -860,7 +860,7 @@ async function startAngelWebSocket(sessionId, session) {
                 if (clientSessionId !== sessionId) continue;
                 try {
                     clientRes.write(`data: ${JSON.stringify(normalizedTick)}\n\n`);
-                } catch (_) {}
+                } catch (_) { }
             }
         });
 
@@ -883,7 +883,7 @@ async function startAngelWebSocket(sessionId, session) {
 function stopAngelWebSocket(sessionId) {
     const ws = angelWebSockets.get(sessionId);
     if (ws) {
-        try { ws.close(); } catch (_) {}
+        try { ws.close(); } catch (_) { }
         angelWebSockets.delete(sessionId);
     }
     latestTicksBySession.delete(sessionId);
@@ -2226,7 +2226,7 @@ async function getNsePriorityStocks() {
 
                             const latest =
                                 daily[
-                                    daily.length - 1
+                                daily.length - 1
                                 ];
 
 
@@ -3233,7 +3233,7 @@ async function getNseResultStatsFromCandles(symbol, candles) {
             console.log(
                 `NSE DAILY LAST ROW ${symbol}:`,
                 dailyRaw[
-                    dailyRaw.length - 1
+                dailyRaw.length - 1
                 ]
             );
 
@@ -3339,7 +3339,7 @@ async function getNseResultStatsFromCandles(symbol, candles) {
 
             const latestDaily =
                 daily[
-                    daily.length - 1
+                daily.length - 1
                 ];
 
 
@@ -3513,7 +3513,7 @@ async function getNseResultStatsFromCandles(symbol, candles) {
 
     const latest =
         ordered[
-            ordered.length - 1
+        ordered.length - 1
         ];
 
 
@@ -3573,12 +3573,12 @@ async function getNseResultStatsFromCandles(symbol, candles) {
                     )
             )
         ]
-        .sort();
+            .sort();
 
 
     const previousDay =
         previousDays[
-            previousDays.length - 1
+        previousDays.length - 1
         ];
 
 
@@ -4046,22 +4046,22 @@ app.get("/api/scanner/nse/check-adsl", async (req, res) => {
         const timeframe = "5m";
 
         const candles = await getNseCandles(
-    symbol,
-    timeframe
-);
+            symbol,
+            timeframe
+        );
 
-if (!candles || candles.length === 0) {
-    return res.json({
-        success: false,
-        message: "No candles"
-    });
-}
+        if (!candles || candles.length === 0) {
+            return res.json({
+                success: false,
+                message: "No candles"
+            });
+        }
 
-const stats =
-    await getNseResultStatsFromCandles(
-        symbol,
-        candles
-    );
+        const stats =
+            await getNseResultStatsFromCandles(
+                symbol,
+                candles
+            );
 
         return res.json({
             success: true,
@@ -4235,12 +4235,12 @@ function normalizeNseIndexHistorical(raw) {
 function normalizeNseIndexIntradayCandles(graph, timeframe = "5m") {
     const intervalMinutes =
         timeframe === "1m" ? 1 :
-        timeframe === "3m" ? 3 :
-        timeframe === "5m" ? 5 :
-        timeframe === "15m" ? 15 :
-        timeframe === "30m" ? 30 :
-        timeframe === "1h" ? 60 :
-        null;
+            timeframe === "3m" ? 3 :
+                timeframe === "5m" ? 5 :
+                    timeframe === "15m" ? 15 :
+                        timeframe === "30m" ? 30 :
+                            timeframe === "1h" ? 60 :
+                                null;
 
     if (!intervalMinutes || !Array.isArray(graph)) {
         return [];
@@ -4432,6 +4432,7 @@ function normalizeMarketCandleShape(candles) {
 }
 
 async function getNseMarketCandles(symbol, timeframe = "5m") {
+
     const normalizedSymbol = String(symbol || "")
         .trim()
         .toUpperCase();
@@ -4440,64 +4441,208 @@ async function getNseMarketCandles(symbol, timeframe = "5m") {
         .trim()
         .toLowerCase();
 
-    const intradayTimeframes = new Set([
-        "1m", "3m", "5m", "15m", "30m", "1h"
-    ]);
+    /*
+     * =========================================================
+     * NSE EQUITY STOCKS
+     * =========================================================
+     *
+     * IMPORTANT:
+     * Do NOT use MCP live snapshots for chart history.
+     *
+     * The existing getNseCandles() function already fetches
+     * proper NSE historical OHLC candles with enough history
+     * for EMA / RSI / ADX / VWAP / S/R calculations.
+     */
+    if (normalizedSymbol !== "NIFTY 50") {
 
-    if (!intradayTimeframes.has(tf)) {
-        // Keep the existing NSE daily path for 1D only. Intraday guest
-        // market data is handled exclusively by the official NSE MCP below.
-        return normalizeMarketCandleShape(
-            await getNseCandles(normalizedSymbol, tf, true)
-        );
-    }
-
-    // NSE changed Tata Motors' current traded symbol to TMPV.
-    // EMA360 keeps TATAMOTORS as its UI symbol and translates only at the
-    // data boundary.
-    const mcpSymbol = normalizedSymbol === "TATAMOTORS"
-        ? "TMPV"
-        : normalizedSymbol;
-
-    try {
-        if (normalizedSymbol === "NIFTY 50") {
-            const candles = await nseMcpClient.getIndexIntradayCandles(
-                "NIFTY 50",
-                tf
-            );
-
-            console.log(
-                "🇮🇳 NSE MCP INDEX CANDLES:",
-                normalizedSymbol,
-                tf,
-                "candles =",
-                Array.isArray(candles) ? candles.length : 0
-            );
-
-            return normalizeMarketCandleShape(candles || []);
-        }
-
-        const candles = await nseMcpClient.getIntradayCandles(
-            mcpSymbol,
+        console.log(
+            "🇮🇳 NSE HISTORICAL EQUITY CANDLES:",
+            normalizedSymbol,
             tf
         );
 
-        console.log(
-            "🇮🇳 NSE MCP CANDLES:",
+        const candles = await getNseCandles(
             normalizedSymbol,
-            "->",
-            mcpSymbol,
             tf,
-            "candles =",
-            Array.isArray(candles) ? candles.length : 0
+            true
         );
 
-        return normalizeMarketCandleShape(candles || []);
-    } catch (error) {
-        console.error(
-            `❌ NSE MCP candle fetch failed for ${normalizedSymbol} (${mcpSymbol}) ${tf}:`,
-            error?.stack || error?.message || error
+        return normalizeMarketCandleShape(candles);
+    }
+
+    /*
+     * =========================================================
+     * NIFTY 50 INDEX
+     * =========================================================
+     *
+     * NIFTY 50 is an INDEX, not an equity.
+     *
+     * Therefore we use NSE's charting OHLC endpoint with
+     * symbolType = "Index".
+     */
+    const timeframeConfig = {
+
+        "1m": {
+            interval: 1,
+            days: 15
+        },
+
+        "3m": {
+            interval: 3,
+            days: 30
+        },
+
+        "5m": {
+            interval: 5,
+            days: 60
+        },
+
+        "15m": {
+            interval: 15,
+            days: 120
+        },
+
+        "30m": {
+            interval: 30,
+            days: 180
+        },
+
+        "1h": {
+            interval: 60,
+            days: 365
+        },
+
+        "1d": {
+            interval: "D",
+            days: 1000
+        }
+
+    };
+
+    const config = timeframeConfig[tf];
+
+    if (!config) {
+        throw new Error(
+            `Unsupported NSE NIFTY timeframe: ${tf}`
         );
+    }
+
+    const now = new Date();
+
+    const start = new Date(
+        now.getTime() -
+        config.days * 24 * 60 * 60 * 1000
+    );
+
+    try {
+
+        /*
+         * Get NIFTY 50's NSE charting token.
+         */
+        const symbolInfo =
+            await nseIndia.getEquitySymbolInfo(
+                "NIFTY 50"
+            );
+
+        const token =
+            symbolInfo?.scripcode ||
+            symbolInfo?.scripCode ||
+            symbolInfo?.token;
+
+        console.log(
+            "🇮🇳 NIFTY 50 NSE TOKEN:",
+            token
+        );
+
+        if (!token) {
+            throw new Error(
+                "NIFTY 50 charting token was not returned by NSE"
+            );
+        }
+
+        /*
+         * Fetch REAL historical NIFTY OHLC candles.
+         */
+        const response =
+            await nseIndia.getEquityChartHistoricalData(
+                "NIFTY 50",
+                {
+                    start,
+                    end: now
+                },
+                token,
+                "Index",
+                tf === "1d" ? "D" : "I",
+                config.interval
+            );
+
+        const candles =
+            normalizeMarketCandleShape(
+                normalizeNseCandles(response)
+            );
+
+        console.log(
+            "🇮🇳 NIFTY 50 NSE OHLC:",
+            tf,
+            "candles =",
+            candles.length,
+            "last =",
+            candles.at(-1)
+        );
+
+        if (candles.length) {
+            return candles;
+        }
+
+        throw new Error(
+            "NSE NIFTY 50 charting returned no OHLC candles"
+        );
+
+    } catch (error) {
+
+        console.error(
+            `❌ NIFTY 50 NSE historical candles failed (${tf}):`,
+            error?.message || error
+        );
+
+        /*
+         * Daily fallback.
+         */
+        if (tf === "1d") {
+
+            try {
+
+                const historical =
+                    await nseIndia.getIndexHistoricalData(
+                        "NIFTY 50",
+                        {
+                            start,
+                            end: now
+                        }
+                    );
+
+                const candles =
+                    normalizeMarketCandleShape(
+                        normalizeNseIndexHistorical(
+                            historical
+                        )
+                    );
+
+                if (candles.length) {
+                    return candles;
+                }
+
+            } catch (fallbackError) {
+
+                console.error(
+                    "❌ NIFTY 50 daily fallback failed:",
+                    fallbackError?.message ||
+                    fallbackError
+                );
+
+            }
+        }
+
         return [];
     }
 }
@@ -4552,26 +4697,80 @@ async function fetchNseMarketQuote(symbol) {
             let result;
 
             if (requestedSymbol === "NIFTY 50") {
-                const details = await nseMcpClient.getIndexIntradayData("NIFTY 50");
-                const price = Number(details?.price);
-                const previousClose = Number(details?.previousClose);
-                const change = Number(details?.change);
 
-                if (!Number.isFinite(price) || price <= 0) {
-                    throw new Error("NSE MCP did not return NIFTY 50 price");
+                const indexData =
+                    await nseIndia.getEquityStockIndices(
+                        "NIFTY 50"
+                    );
+
+                const metadata =
+                    indexData?.metadata || {};
+
+                const price = Number(
+                    metadata.last ??
+                    metadata.lastPrice ??
+                    metadata.ltp ??
+                    metadata.close
+                );
+
+                const previousClose = Number(
+                    metadata.previousClose ??
+                    metadata.prevClose
+                );
+
+                const change =
+                    Number.isFinite(previousClose) &&
+                        previousClose > 0
+                        ? ((price - previousClose) / previousClose) * 100
+                        : Number(
+                            metadata.percChange ??
+                            metadata.pChange
+                        );
+
+                if (
+                    !Number.isFinite(price) ||
+                    price <= 0
+                ) {
+                    throw new Error(
+                        "NSE did not return NIFTY 50 current price"
+                    );
                 }
 
                 result = {
+
                     source: "NSE",
-                    symbol: requestedSymbol,
+
+                    symbol: "NIFTY 50",
+
                     price,
-                    previousClose: Number.isFinite(previousClose) ? previousClose : null,
-                    change: Number.isFinite(change) ? change : null,
+
+                    previousClose:
+                        Number.isFinite(previousClose)
+                            ? previousClose
+                            : null,
+
+                    change:
+                        Number.isFinite(change)
+                            ? change
+                            : null,
+
                     volume: null,
-                    open: Number.isFinite(Number(details?.open)) ? Number(details.open) : null,
-                    high: Number.isFinite(Number(details?.high)) ? Number(details.high) : null,
-                    low: Number.isFinite(Number(details?.low)) ? Number(details.low) : null,
-                    timestamp: details?.timestamp || new Date().toISOString()
+
+                    open:
+                        Number(metadata.open) || null,
+
+                    high:
+                        Number(metadata.dayHigh) ||
+                        Number(metadata.high) ||
+                        null,
+
+                    low:
+                        Number(metadata.dayLow) ||
+                        Number(metadata.low) ||
+                        null,
+
+                    timestamp:
+                        new Date().toISOString()
                 };
             } else {
                 const nseSymbol = requestedSymbol === "TATAMOTORS"
@@ -4972,101 +5171,172 @@ function findMcpQuoteObject(value, depth = 0) {
 }
 
 async function fetchNseHeaderIndices() {
+
     const now = Date.now();
 
     if (
         NSE_HEADER_INDICES_CACHE.timestamp &&
         now - NSE_HEADER_INDICES_CACHE.timestamp < 5000 &&
-        Object.keys(NSE_HEADER_INDICES_CACHE.indices).length
+        Object.keys(
+            NSE_HEADER_INDICES_CACHE.indices
+        ).length
     ) {
         return NSE_HEADER_INDICES_CACHE.indices;
     }
 
     const indexNames = [
+
         ["BANKNIFTY", "NIFTY BANK"],
+
         ["FINNIFTY", "NIFTY FIN SERVICE"],
+
         ["NIFTY 50", "NIFTY 50"],
+
         ["NIFTYIT", "NIFTY IT"],
+
         ["NIFTYMIDCAP100", "NIFTY MIDCAP 100"],
+
         ["NIFTYNXT50", "NIFTY NEXT 50"],
+
         ["NIFTYPHARMA", "NIFTY PHARMA"],
+
         ["NIFTYSMALL100", "NIFTY SMLCAP 100"]
+
     ];
 
     const output = {};
 
-    for (const [label, nseName] of indexNames) {
+    for (
+        const [label, nseIndexName]
+        of indexNames
+    ) {
+
         try {
-            const payload = await nseMcpClient.callLiveMarket(nseName);
-            const row = findMcpQuoteObject(payload);
-            if (!row) continue;
 
-            const price = pickNumber(
-                row?.lastPrice,
-                row?.ltp,
-                row?.last,
-                row?.indexValue,
-                row?.currentValue,
-                row?.value,
-                row?.close
+            const indexData =
+                await nseIndia.getEquityStockIndices(
+                    nseIndexName
+                );
+
+            const metadata =
+                indexData?.metadata || {};
+
+            const price = Number(
+                metadata.last ??
+                metadata.lastPrice ??
+                metadata.ltp ??
+                metadata.close
             );
 
-            if (!Number.isFinite(price)) continue;
+            if (
+                !Number.isFinite(price)
+            ) {
+                continue;
+            }
 
-            const previousClose = pickNumber(
-                row?.previousClose,
-                row?.prevClose,
-                row?.previous_close
-            );
+            const previousClose =
+                Number(
+                    metadata.previousClose ??
+                    metadata.prevClose
+                );
 
             const change =
-                Number.isFinite(previousClose) && previousClose > 0
-                    ? ((price - previousClose) / previousClose) * 100
-                    : pickNumber(row?.pChange, row?.percentChange, row?.percChange);
+                Number.isFinite(previousClose) &&
+                previousClose > 0
+                    ? ((price - previousClose) /
+                        previousClose) * 100
+                    : Number(
+                        metadata.percChange ??
+                        metadata.pChange
+                    );
 
             output[label] = {
+
                 source: "NSE",
+
                 name: label,
+
                 price,
-                previousClose: Number.isFinite(previousClose) ? previousClose : null,
-                change: Number.isFinite(change) ? change : null,
-                timestamp: new Date().toISOString()
+
+                previousClose:
+                    Number.isFinite(previousClose)
+                        ? previousClose
+                        : null,
+
+                change:
+                    Number.isFinite(change)
+                        ? change
+                        : null,
+
+                timestamp:
+                    new Date().toISOString()
             };
+
         } catch (error) {
+
             console.warn(
-                `⚠️ NSE MCP header index failed for ${label}:`,
+                `⚠️ NSE header index ${nseIndexName} failed:`,
                 error?.message || error
             );
+
         }
     }
 
-    // EMA360's former SENSEX slot is now RELIANCE in NSE-only mode.
+    /*
+     * EMA360 uses RELIANCE in this NSE-only header slot.
+     */
     try {
-        const reliance = await fetchNseMarketQuote("RELIANCE");
+
+        const reliance =
+            await fetchNseMarketQuote(
+                "RELIANCE"
+            );
+
         if (reliance) {
+
             output.RELIANCE = {
+
                 source: "NSE",
+
                 name: "RELIANCE",
-                price: reliance.price,
-                previousClose: reliance.previousClose,
-                change: reliance.change,
-                timestamp: reliance.timestamp
+
+                price:
+                    reliance.price,
+
+                previousClose:
+                    reliance.previousClose,
+
+                change:
+                    reliance.change,
+
+                timestamp:
+                    reliance.timestamp
             };
         }
+
     } catch (error) {
+
         console.warn(
-            "⚠️ NSE MCP header RELIANCE quote failed:",
+            "⚠️ NSE header RELIANCE failed:",
             error?.message || error
+        );
+
+    }
+
+    if (
+        !Object.keys(output).length
+    ) {
+        throw new Error(
+            "NSE returned no header index data"
         );
     }
 
-    if (!Object.keys(output).length) {
-        throw new Error("NSE MCP returned no header index data");
-    }
-
     NSE_HEADER_INDICES_CACHE = {
+
         timestamp: Date.now(),
+
         indices: output
+
     };
 
     return output;
@@ -5274,10 +5544,10 @@ app.get("/api/scanner/nse/candles", async (req, res) => {
          * snapshot. No second NSE quote request is made here.
          */
         const stats =
-    await getNseResultStatsFromCandles(
-        symbol,
-        candles
-    );
+            await getNseResultStatsFromCandles(
+                symbol,
+                candles
+            );
 
         if (!stats) {
             return res.json({
@@ -5914,7 +6184,7 @@ async function fetchNseLargeDeals() {
     if (
         NSE_LARGE_DEALS_CACHE.data &&
         now - NSE_LARGE_DEALS_CACHE.timestamp <
-            NSE_LARGE_DEALS_CACHE_MS
+        NSE_LARGE_DEALS_CACHE_MS
     ) {
 
         return NSE_LARGE_DEALS_CACHE.data;
