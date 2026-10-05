@@ -95,6 +95,41 @@ function useMarketData(dataSource = "angel") {
     const [marketIndices, setMarketIndices] =
         useState({});
 
+    // =========================================================
+    // CLEAR OLD SOURCE DATA WHEN DATA SOURCE CHANGES
+    // =========================================================
+    // IMPORTANT:
+    // Angel One data must never be reused in NSE mode.
+    // NSE data must never be reused in Angel One mode.
+    // Calculation logic is NOT changed here.
+    // =========================================================
+
+    useEffect(() => {
+
+        console.log(
+            `🔄 DATA SOURCE CHANGED → ${activeSource.toUpperCase()}`
+        );
+
+        // Clear candle cache
+        stockDataRef.current = {};
+
+        // Clear React stock data
+        setStockData({});
+
+        // Clear currently displayed candles
+        setCandles([]);
+
+        // Reset previous price
+        setPreviousPrice(0);
+
+        // Clear live market quote cache
+        setMarketQuotes({});
+
+        // Force dependent components to refresh
+        setDataVersion(previous => previous + 1);
+
+    }, [activeSource]);
+
     /* =========================================================
        SELECTION REQUEST ID
 
@@ -158,12 +193,12 @@ function useMarketData(dataSource = "angel") {
 
         const timeframeMinutes =
             currentTF === "1M" ? 1 :
-            currentTF === "3M" ? 3 :
-            currentTF === "5M" ? 5 :
-            currentTF === "15M" ? 15 :
-            currentTF === "30M" ? 30 :
-            currentTF === "1H" ? 60 :
-            currentTF === "1D" ? 1440 : 5;
+                currentTF === "3M" ? 3 :
+                    currentTF === "5M" ? 5 :
+                        currentTF === "15M" ? 15 :
+                            currentTF === "30M" ? 30 :
+                                currentTF === "1H" ? 60 :
+                                    currentTF === "1D" ? 1440 : 5;
 
         /** Daily candles should update their current day's OHLC. */
         let candleTime = new Date(tickTime);
@@ -254,7 +289,7 @@ function useMarketData(dataSource = "angel") {
 
             try {
                 liveStreamRef.current?.close();
-            } catch (_) {}
+            } catch (_) { }
 
             const stream = createLiveStream();
 
@@ -286,7 +321,7 @@ function useMarketData(dataSource = "angel") {
 
                 try {
                     stream.close();
-                } catch (_) {}
+                } catch (_) { }
 
                 if (!liveStreamMountedRef.current) return;
 
@@ -352,7 +387,7 @@ function useMarketData(dataSource = "angel") {
 
             try {
                 liveStreamRef.current?.close();
-            } catch (_) {}
+            } catch (_) { }
 
             liveStreamRef.current = null;
 
@@ -387,12 +422,12 @@ function useMarketData(dataSource = "angel") {
 
         const timeframeMinutes = value =>
             value === "1M" ? 1 :
-            value === "3M" ? 3 :
-            value === "5M" ? 5 :
-            value === "15M" ? 15 :
-            value === "30M" ? 30 :
-            value === "1H" ? 60 :
-            1440;
+                value === "3M" ? 3 :
+                    value === "5M" ? 5 :
+                        value === "15M" ? 15 :
+                            value === "30M" ? 30 :
+                                value === "1H" ? 60 :
+                                    1440;
 
         function getMarketBucket(date, minutes) {
 
@@ -1138,7 +1173,7 @@ function useMarketData(dataSource = "angel") {
 
                     const restoredCandles =
                         stockDataRef.current[
-                            priorityStock
+                        priorityStock
                         ]?.[currentTF] || [];
 
                     setCandles(
@@ -1408,7 +1443,7 @@ function useMarketData(dataSource = "angel") {
 
                     let selectedCandles =
                         stockDataRef.current[
-                            stock
+                        stock
                         ]?.[currentTF];
 
                     if (
