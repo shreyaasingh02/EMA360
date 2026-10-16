@@ -5197,3 +5197,18 @@ footer {
     padding: 5px 10px;
   }
 }
+
+.ema360-ticker .ema360-ticker-price.up,
+.ema360-ticker .ema360-ticker-change.up {
+  color: #19e3a0 !important;
+}
+
+.ema360-ticker .ema360-ticker-price.down,
+.ema360-ticker .ema360-ticker-change.down {
+  color: #ff6679 !important;
+}
+
+.ema360-ticker .ema360-ticker-price.flat,
+.ema360-ticker .ema360-ticker-change.flat {
+  color: #b8c8d3 !important;
+}

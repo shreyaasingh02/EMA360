@@ -62,66 +62,66 @@ function candleRows(stockData = {}) {
 
 
 function quoteRows(source = {}) {
-  return Object.entries(source || {})
-    .map(([key, quote]) => {
-      if (!quote || typeof quote !== "object") return null;
+    return Object.entries(source || {})
+        .map(([key, quote]) => {
+            if (!quote || typeof quote !== "object") return null;
 
-      const symbol = quote.symbol || quote.name || key;
+            const symbol = quote.symbol || quote.name || key;
 
-      const price = toNumber(
-        quote.price,
-        quote.ltp,
-        quote.lastPrice,
-        quote.last_traded_price
-      );
+            const price = toNumber(
+                quote.price,
+                quote.ltp,
+                quote.lastPrice,
+                quote.last_traded_price
+            );
 
-      const previousClose = toNumber(
-        quote.previousClose,
-        quote.prevClose,
-        quote.previous_close
-      );
+            const previousClose = toNumber(
+                quote.previousClose,
+                quote.prevClose,
+                quote.previous_close
+            );
 
-      const rawChange = toNumber(quote.change);
+            const rawChange = toNumber(quote.change);
 
-      const explicitPercent = toNumber(
-        quote.percent,
-        quote.percentChange,
-        quote.changePercent,
-        quote.percentageChange,
-        quote.change_pct,
-        quote.pChange,
-        quote.pchange
-      );
+            const explicitPercent = toNumber(
+                quote.percent,
+                quote.percentChange,
+                quote.changePercent,
+                quote.percentageChange,
+                quote.change_pct,
+                quote.pChange,
+                quote.pchange
+            );
 
-      let change = null;
-      let percent = explicitPercent;
+            let change = null;
+            let percent = explicitPercent;
 
-      if (price != null && previousClose != null && previousClose > 0) {
-        change = price - previousClose;
-        percent = (change / previousClose) * 100;
-      } else if (rawChange != null) {
-        if (quote.changeIsPercent === true) {
-          percent = rawChange;
-        } else if (quote.changeIsPercent === false) {
-          change = rawChange;
-        } else if (percent == null) {
-          // Use the API's `change` only if its documented meaning is percent.
-          percent = rawChange;
-        }
-      }
+            if (price != null && previousClose != null && previousClose > 0) {
+                change = price - previousClose;
+                percent = (change / previousClose) * 100;
+            } else if (rawChange != null) {
+                if (quote.changeIsPercent === true) {
+                    percent = rawChange;
+                } else if (quote.changeIsPercent === false) {
+                    change = rawChange;
+                } else if (percent == null) {
+                    // Use the API's `change` only if its documented meaning is percent.
+                    percent = rawChange;
+                }
+            }
 
-      return {
-        symbol: String(symbol),
-        price,
-        change,
-        percent,
-        volume: toNumber(
-          quote.volume,
-          quote.totalTradedVolume
-        ) ?? 0
-      };
-    })
-    .filter(Boolean);
+            return {
+                symbol: String(symbol),
+                price,
+                change,
+                percent,
+                volume: toNumber(
+                    quote.volume,
+                    quote.totalTradedVolume
+                ) ?? 0
+            };
+        })
+        .filter(Boolean);
 }
 
 
@@ -132,12 +132,12 @@ function MarketTicker({
 }) {
     const isAngel = session?.dataSource === "angel";
     console.log("TICKER INPUTS", {
-  source: session?.dataSource,
-  stockDataKeys: Object.keys(stockData || {}),
-  marketQuoteKeys: Object.keys(marketQuotes || {}),
-  marketIndexKeys: Object.keys(marketIndices || {}),
-  dataVersion
-});
+        source: session?.dataSource,
+        stockDataKeys: Object.keys(stockData || {}),
+        marketQuoteKeys: Object.keys(marketQuotes || {}),
+        marketIndexKeys: Object.keys(marketIndices || {}),
+        dataVersion
+    });
 
     const rows = useMemo(() => {
         // Strict source separation: no NSE fallback in Angel One mode.
@@ -145,8 +145,8 @@ function MarketTicker({
             ? [...quoteRows(marketQuotes), ...candleRows(stockData)]
             : [...quoteRows(marketIndices), ...quoteRows(marketQuotes)];
 
-            console.log("Ticker source:", isAngel ? "Angel One" : "NSE");
-console.log("Ticker raw rows:", rawRows.slice(0, 5));
+        console.log("Ticker source:", isAngel ? "Angel One" : "NSE");
+        console.log("Ticker raw rows:", rawRows.slice(0, 5));
         const bySymbol = new Map();
         for (const row of rawRows) {
             const key = normalizeSymbol(row.symbol);
@@ -193,8 +193,12 @@ console.log("Ticker raw rows:", rawRows.slice(0, 5));
                                 {selectedStock && normalizeSymbol(selectedStock) === normalizeSymbol(row.symbol)
                                     ? <span className="ema360-ticker-selected"> •</span> : null}
                             </span>
-                            <span className="ema360-ticker-price">{formatPrice(row.price)}</span>
-                            <span className={`ema360-ticker-change ${tone}`}>{formatPercent(row.percent)}</span>
+                            <span className={`ema360-ticker-price ${tone}`}>
+                                {formatPrice(row.price)}
+                            </span>
+                            <span className={`ema360-ticker-change ${tone}`}>
+                                {formatPercent(row.percent)}
+                            </span>
                         </button>
                     );
                 })}
