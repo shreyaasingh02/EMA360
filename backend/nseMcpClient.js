@@ -1,10 +1,6 @@
 const NSE_MCP_LIVE_URL = "https://mcp.nseindia.in/cmmkt/mcp";
 
-
-
 const NSE_MCP_BHAVCOPY_URL = "https://mcp.nseindia.in/bhavcopy/cm/mcp";
-
-
 
 const REDIS_URL = String(process.env.REDIS_URL || "").trim();
 
@@ -14,1617 +10,998 @@ let nseSnapshotRedis = null;
 
 if (REDIS_URL) {
 
-  try {
+  try {
 
-    Redis = require("ioredis");
+    Redis = require("ioredis");
 
-    nseSnapshotRedis = new Redis(REDIS_URL, {
+    nseSnapshotRedis = new Redis(REDIS_URL, {
 
-      maxRetriesPerRequest: 2,
+      maxRetriesPerRequest: 2,
 
-      enableReadyCheck: true
+      enableReadyCheck: true
 
-    });
+    });
 
-    nseSnapshotRedis.on("error", error => {
+    nseSnapshotRedis.on("error", error => {
 
-      console.warn("⚠️ NSE snapshot Redis error:", error?.message || error);
+      console.warn("⚠️ NSE snapshot Redis error:", error?.message || error);
 
-    });
+    });
 
-  } catch (error) {
+  } catch (error) {
 
-    console.warn("⚠️ ioredis unavailable; NSE candle snapshots will be memory-only:", error?.message || error);
+    console.warn("⚠️ ioredis unavailable; NSE candle snapshots will be memory-only:", error?.message || error);
 
-  }
+  }
 
 }
-
-
 
 const NSE_SNAPSHOT_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 const NSE_SAMPLE_MIN_GAP_MS = 10 * 1000;
 
-
-
 function firstQuoteObject(value, depth = 0) {
 
-  if (depth > 8 || value == null) return null;
+  if (depth > 8 || value == null) return null;
 
+  if (Array.isArray(value)) {
 
+    for (const item of value) {
 
-  if (Array.isArray(value)) {
+      const found = firstQuoteObject(item, depth + 1);
 
-    for (const item of value) {
+      if (found) return found;
 
-      const found = firstQuoteObject(item, depth + 1);
+    }
 
-      if (found) return found;
+    return null;
 
-    }
+  }
 
-    return null;
+  if (typeof value !== "object") return null;
 
-  }
+  const priceKeys = [
 
+    "lastPrice", "ltp", "last", "close", "lastTradedPrice",
 
+    "last_traded_price", "lastPriceValue", "currentPrice"
 
-  if (typeof value !== "object") return null;
+  ];
 
+  if (priceKeys.some(key => value[key] !== undefined && value[key] !== null)) {
 
+    return value;
 
-  const priceKeys = [
+  }
 
-    "lastPrice", "ltp", "last", "close", "lastTradedPrice",
+  for (const item of Object.values(value)) {
 
-    "last_traded_price", "lastPriceValue", "currentPrice"
+    const found = firstQuoteObject(item, depth + 1);
 
-  ];
+    if (found) return found;
 
+  }
 
-
-  if (priceKeys.some(key => value[key] !== undefined && value[key] !== null)) {
-
-    return value;
-
-  }
-
-
-
-  for (const item of Object.values(value)) {
-
-    const found = firstQuoteObject(item, depth + 1);
-
-    if (found) return found;
-
-  }
-
-
-
-  return null;
+  return null;
 
 }
-
-
 
 function quoteNumber(row, ...keys) {
 
-  for (const key of keys) {
+  for (const key of keys) {
 
-    const value = Number(row?.[key]);
+    const value = Number(row?.[key]);
 
-    if (Number.isFinite(value)) return value;
+    if (Number.isFinite(value)) return value;
 
-  }
+  }
 
-  return null;
+  return null;
 
 }
-
-
-
-
-
-
 
 function sleep(ms) {
 
-
-
-  return new Promise(resolve => setTimeout(resolve, ms));
-
-
+  return new Promise(resolve => setTimeout(resolve, ms));
 
 }
-
-
-
-
-
-
 
 function parseSse(text) {
 
+  const messages = [];
 
+  let event = "message";
 
-  const messages = [];
+  let data = [];
 
+  for (const line of String(text || "").split(/\r?\n/)) {
 
+    if (line.startsWith("event:")) event = line.slice(6).trim();
 
-  let event = "message";
+    else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
 
+    else if (line === "" && data.length) {
 
+      messages.push({ event, data: data.join("\n") });
 
-  let data = [];
+      event = "message";
 
+      data = [];
 
+    }
 
-  for (const line of String(text || "").split(/\r?\n/)) {
+  }
 
+  if (data.length) messages.push({ event, data: data.join("\n") });
 
+  for (const item of messages.reverse()) {
 
-    if (line.startsWith("event:")) event = line.slice(6).trim();
+    try { return JSON.parse(item.data); } catch (_) {}
 
+  }
 
-
-    else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
-
-
-
-    else if (line === "" && data.length) {
-
-
-
-      messages.push({ event, data: data.join("\n") });
-
-
-
-      event = "message";
-
-
-
-      data = [];
-
-
-
-    }
-
-
-
-  }
-
-
-
-  if (data.length) messages.push({ event, data: data.join("\n") });
-
-
-
-  for (const item of messages.reverse()) {
-
-
-
-    try { return JSON.parse(item.data); } catch (_) {}
-
-
-
-  }
-
-
-
-  return null;
-
-
+  return null;
 
 }
-
-
-
-
-
-
 
 async function readResponse(response) {
 
+  const text = await response.text();
 
+  if (!text) return null;
 
-  const text = await response.text();
+  const type = String(response.headers.get("content-type") || "").toLowerCase();
 
+  if (type.includes("text/event-stream")) return parseSse(text);
 
-
-  if (!text) return null;
-
-
-
-  const type = String(response.headers.get("content-type") || "").toLowerCase();
-
-
-
-  if (type.includes("text/event-stream")) return parseSse(text);
-
-
-
-  try { return JSON.parse(text); } catch (_) { return parseSse(text); }
-
-
+  try { return JSON.parse(text); } catch (_) { return parseSse(text); }
 
 }
-
-
-
-
-
-
 
 class NseMcpConnection {
 
+  constructor(url) {
 
+    this.url = url;
 
-  constructor(url) {
+    this.sessionId = null;
 
+    this.nextId = 1;
 
+    this.initialized = false;
 
-    this.url = url;
+    this.tools = null;
 
+    this.queue = Promise.resolve();
 
+  }
 
-    this.sessionId = null;
+  runSerialized(fn) {
 
+    const run = this.queue.then(fn);
 
+    this.queue = run.catch(() => undefined);
 
-    this.nextId = 1;
+    return run;
 
+  }
 
+  async initialize() {
 
-    this.initialized = false;
+    if (this.initialized) return;
 
+    await this.runSerialized(async () => {
 
+      if (this.initialized) return;
 
-    this.tools = null;
+      const result = await this.rawRequest("initialize", {
 
+        protocolVersion: "2025-03-26",
 
+        capabilities: {},
 
-    this.queue = Promise.resolve();
+        clientInfo: { name: "EMA360", version: "1.0.0" }
 
+      });
 
+      if (result?.error) throw new Error(result.error.message || "NSE MCP initialize failed");
 
-  }
+      this.initialized = true;
 
+      await this.rawNotification("notifications/initialized", {});
 
+    });
 
+  }
 
+  async rawRequest(method, params) {
 
+    const id = this.nextId++;
 
+    const headers = {
 
-  runSerialized(fn) {
+      "Content-Type": "application/json",
 
+      "Accept": "application/json, text/event-stream"
 
+    };
 
-    const run = this.queue.then(fn);
+    if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    let response;
+    try {
+      response = await fetch(this.url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        this.initialized = false;
+        this.sessionId = null;
+        this.tools = null;
+        throw new Error(`NSE MCP request timed out after 8000ms (${method})`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
 
+    const sid = response.headers.get("mcp-session-id");
 
-    this.queue = run.catch(() => undefined);
+    if (sid) this.sessionId = sid;
 
+    const payload = await readResponse(response);
 
+    if (!response.ok) {
 
-    return run;
+      const message = payload?.error?.message || payload?.message || `NSE MCP HTTP ${response.status}`;
 
+      throw new Error(message);
 
+    }
 
-  }
+    return payload;
 
+  }
 
+  async rawNotification(method, params) {
 
+    const headers = {
 
+      "Content-Type": "application/json",
 
+      "Accept": "application/json, text/event-stream"
 
+    };
 
-  async initialize() {
+    if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
 
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    let response;
+    try {
+      response = await fetch(this.url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ jsonrpc: "2.0", method, params }),
+        signal: controller.signal
+      });
+    } catch (error) {
+      if (error?.name === "AbortError") {
+        this.initialized = false;
+        this.sessionId = null;
+        this.tools = null;
+        throw new Error(`NSE MCP notification timed out after 8000ms (${method})`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
 
+    if (!response.ok && response.status !== 202) {
 
-    if (this.initialized) return;
+      const text = await response.text();
 
+      throw new Error(`NSE MCP notification failed: ${response.status} ${text.slice(0, 200)}`);
 
+    }
 
-    await this.runSerialized(async () => {
+  }
 
+  async listTools() {
 
+    await this.initialize();
 
-      if (this.initialized) return;
+    if (this.tools) return this.tools;
 
+    return this.runSerialized(async () => {
 
+      if (this.tools) return this.tools;
 
-      const result = await this.rawRequest("initialize", {
+      const result = await this.rawRequest("tools/list", {});
 
+      if (result?.error) throw new Error(result.error.message || "NSE MCP tools/list failed");
 
+      this.tools = result?.result?.tools || [];
 
-        protocolVersion: "2025-03-26",
+      return this.tools;
 
+    });
 
+  }
 
-        capabilities: {},
+  async callTool(name, args = {}, urlOverride = null) {
 
+    const connection = urlOverride ? new NseMcpConnection(urlOverride) : this;
 
+    if (urlOverride) await connection.initialize();
 
-        clientInfo: { name: "EMA360", version: "1.0.0" }
+    else await this.initialize();
 
+    return connection.runSerialized(async () => {
 
+      const result = await connection.rawRequest("tools/call", { name, arguments: args });
 
-      });
+      if (result?.error) throw new Error(result.error.message || `NSE MCP tool ${name} failed`);
 
+      const content = result?.result?.content || [];
 
+      const texts = content.filter(x => x?.type === "text").map(x => x.text);
 
-      if (result?.error) throw new Error(result.error.message || "NSE MCP initialize failed");
+      for (const text of texts) {
 
+        try { return JSON.parse(text); } catch (_) {}
 
+      }
 
-      this.initialized = true;
+      return result?.result;
 
+    });
 
-
-      await this.rawNotification("notifications/initialized", {});
-
-
-
-    });
-
-
-
-  }
-
-
-
-
-
-
-
-  async rawRequest(method, params) {
-
-
-
-    const id = this.nextId++;
-
-
-
-    const headers = {
-
-
-
-      "Content-Type": "application/json",
-
-
-
-      "Accept": "application/json, text/event-stream"
-
-
-
-    };
-
-
-
-    if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
-
-
-
-    const response = await fetch(this.url, {
-
-
-
-      method: "POST",
-
-
-
-      headers,
-
-
-
-      body: JSON.stringify({ jsonrpc: "2.0", id, method, params })
-
-
-
-    });
-
-
-
-    const sid = response.headers.get("mcp-session-id");
-
-
-
-    if (sid) this.sessionId = sid;
-
-
-
-    const payload = await readResponse(response);
-
-
-
-    if (!response.ok) {
-
-
-
-      const message = payload?.error?.message || payload?.message || `NSE MCP HTTP ${response.status}`;
-
-
-
-      throw new Error(message);
-
-
-
-    }
-
-
-
-    return payload;
-
-
-
-  }
-
-
-
-
-
-
-
-  async rawNotification(method, params) {
-
-
-
-    const headers = {
-
-
-
-      "Content-Type": "application/json",
-
-
-
-      "Accept": "application/json, text/event-stream"
-
-
-
-    };
-
-
-
-    if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
-
-
-
-    const response = await fetch(this.url, {
-
-
-
-      method: "POST",
-
-
-
-      headers,
-
-
-
-      body: JSON.stringify({ jsonrpc: "2.0", method, params })
-
-
-
-    });
-
-
-
-    if (!response.ok && response.status !== 202) {
-
-
-
-      const text = await response.text();
-
-
-
-      throw new Error(`NSE MCP notification failed: ${response.status} ${text.slice(0, 200)}`);
-
-
-
-    }
-
-
-
-  }
-
-
-
-
-
-
-
-  async listTools() {
-
-
-
-    await this.initialize();
-
-
-
-    if (this.tools) return this.tools;
-
-
-
-    return this.runSerialized(async () => {
-
-
-
-      if (this.tools) return this.tools;
-
-
-
-      const result = await this.rawRequest("tools/list", {});
-
-
-
-      if (result?.error) throw new Error(result.error.message || "NSE MCP tools/list failed");
-
-
-
-      this.tools = result?.result?.tools || [];
-
-
-
-      return this.tools;
-
-
-
-    });
-
-
-
-  }
-
-
-
-
-
-
-
-  async callTool(name, args = {}, urlOverride = null) {
-
-
-
-    const connection = urlOverride ? new NseMcpConnection(urlOverride) : this;
-
-
-
-    if (urlOverride) await connection.initialize();
-
-
-
-    else await this.initialize();
-
-
-
-    return connection.runSerialized(async () => {
-
-
-
-      const result = await connection.rawRequest("tools/call", { name, arguments: args });
-
-
-
-      if (result?.error) throw new Error(result.error.message || `NSE MCP tool ${name} failed`);
-
-
-
-      const content = result?.result?.content || [];
-
-
-
-      const texts = content.filter(x => x?.type === "text").map(x => x.text);
-
-
-
-      for (const text of texts) {
-
-
-
-        try { return JSON.parse(text); } catch (_) {}
-
-
-
-      }
-
-
-
-      return result?.result;
-
-
-
-    });
-
-
-
-  }
-
-
+  }
 
 }
-
-
-
-
-
-
 
 function firstObject(value) {
 
+  if (Array.isArray(value)) {
 
+    for (const item of value) {
 
-  if (Array.isArray(value)) {
+      const found = firstObject(item);
 
+      if (found) return found;
 
+    }
 
-    for (const item of value) {
+    return null;
 
+  }
 
+  if (value && typeof value === "object") {
 
-      const found = firstObject(item);
+    if (Array.isArray(value.data) || Array.isArray(value.rows) || Array.isArray(value.stocks)) return value;
 
+    for (const item of Object.values(value)) {
 
+      const found = firstObject(item);
 
-      if (found) return found;
+      if (found) return found;
 
+    }
 
+  }
 
-    }
-
-
-
-    return null;
-
-
-
-  }
-
-
-
-  if (value && typeof value === "object") {
-
-
-
-    if (Array.isArray(value.data) || Array.isArray(value.rows) || Array.isArray(value.stocks)) return value;
-
-
-
-    for (const item of Object.values(value)) {
-
-
-
-      const found = firstObject(item);
-
-
-
-      if (found) return found;
-
-
-
-    }
-
-
-
-  }
-
-
-
-  return null;
-
-
+  return null;
 
 }
-
-
-
-
-
-
 
 function extractRows(value) {
 
+  if (Array.isArray(value)) return value;
 
+  if (!value || typeof value !== "object") return [];
 
-  if (Array.isArray(value)) return value;
+  for (const key of ["data", "rows", "stocks", "equities", "results", "items", "quotes", "constituents"]) {
 
+    if (Array.isArray(value[key])) return value[key];
 
+  }
 
-  if (!value || typeof value !== "object") return [];
+  const found = firstObject(value);
 
+  if (found) return extractRows(found);
 
-
-  for (const key of ["data", "rows", "stocks", "equities", "results", "items", "quotes", "constituents"]) {
-
-
-
-    if (Array.isArray(value[key])) return value[key];
-
-
-
-  }
-
-
-
-  const found = firstObject(value);
-
-
-
-  if (found) return extractRows(found);
-
-
-
-  return [];
-
-
+  return [];
 
 }
-
-
-
-
-
-
 
 function extractToolText(value) {
 
+  if (typeof value === "string") return value;
 
+  if (value && typeof value === "object") {
 
-  if (typeof value === "string") return value;
+    if (typeof value.text === "string") return value.text;
 
+    if (Array.isArray(value.content)) {
 
+      for (const c of value.content) {
 
-  if (value && typeof value === "object") {
+        if (typeof c?.text === "string") return c.text;
 
+      }
 
+    }
 
-    if (typeof value.text === "string") return value.text;
+  }
 
-
-
-    if (Array.isArray(value.content)) {
-
-
-
-      for (const c of value.content) {
-
-
-
-        if (typeof c?.text === "string") return c.text;
-
-
-
-      }
-
-
-
-    }
-
-
-
-  }
-
-
-
-  return null;
-
-
+  return null;
 
 }
 
-
-
-
-
-
-
 class NseMcpClient {
 
+  constructor() {
 
+    this.live = new NseMcpConnection(NSE_MCP_LIVE_URL);
 
-  constructor() {
+    this.history = new NseMcpConnection(NSE_MCP_BHAVCOPY_URL);
 
+    this.stockCache = { at: 0, symbols: [] };
 
+    this.snapshotStore = new Map();
 
-    this.live = new NseMcpConnection(NSE_MCP_LIVE_URL);
+    this.snapshotLoaded = new Set();
 
+    this.lastSampleAt = new Map();
 
+  }
 
-    this.history = new NseMcpConnection(NSE_MCP_BHAVCOPY_URL);
+  async getAllStockSymbols() {
 
+    if (this.stockCache.symbols.length && Date.now() - this.stockCache.at < 5 * 60 * 1000) return this.stockCache.symbols;
 
+    const data = await this.live.callTool("cm_get_equity_stocks", {});
 
-    this.stockCache = { at: 0, symbols: [] };
+    const rows = extractRows(data);
 
+    const symbols = [...new Set(rows.map(row => String(row?.symbol || row?.identifier || row?.securitySymbol || "").trim().toUpperCase()).filter(Boolean))];
 
+    this.stockCache = { at: Date.now(), symbols };
 
-    this.snapshotStore = new Map();
+    return symbols;
 
-    this.snapshotLoaded = new Set();
+  }
 
-    this.lastSampleAt = new Map();
+  async getEquityDetails(symbol) {
 
+    const key = String(symbol).trim().toUpperCase();
 
+    const data = await this.live.callTool("cm_get_stock_quote", { symbol: key });
 
-  }
+    const row = firstQuoteObject(data) || {};
 
+    await this.loadSnapshots(key);
 
+    await this.recordSnapshot(key, row);
 
+    return {
 
+      info: {
 
+        companyName: row?.companyName || row?.company || row?.securityName || key
 
+      },
 
-  async getAllStockSymbols() {
+      priceInfo: {
 
+        lastPrice: quoteNumber(row, "lastPrice", "ltp", "last", "lastTradedPrice", "last_traded_price", "close"),
 
+        previousClose: quoteNumber(row, "previousClose", "prevClose", "previous_close"),
 
-    if (this.stockCache.symbols.length && Date.now() - this.stockCache.at < 5 * 60 * 1000) return this.stockCache.symbols;
+        pChange: quoteNumber(row, "pChange", "percentChange", "pchange", "percent_change"),
 
+        open: quoteNumber(row, "open"),
 
+        vwap: quoteNumber(row, "vwap"),
 
-    const data = await this.live.callTool("cm_get_equity_stocks", {});
+        intraDayHighLow: {
 
+          max: quoteNumber(row, "dayHigh", "high"),
 
+          min: quoteNumber(row, "dayLow", "low")
 
-    const rows = extractRows(data);
+        }
 
+      },
 
+      raw: row
 
-    const symbols = [...new Set(rows.map(row => String(row?.symbol || row?.identifier || row?.securitySymbol || "").trim().toUpperCase()).filter(Boolean))];
+    };
 
+  }
 
+  async loadSnapshots(symbol) {
 
-    this.stockCache = { at: Date.now(), symbols };
+    const key = String(symbol).trim().toUpperCase();
 
+    if (this.snapshotLoaded.has(key)) return;
 
+    this.snapshotLoaded.add(key);
 
-    return symbols;
+    if (!nseSnapshotRedis) return;
 
+    try {
 
+      const raw = await nseSnapshotRedis.get(`ema360:nse:snapshots:${key}`);
 
-  }
+      if (!raw) return;
 
+      const parsed = JSON.parse(raw);
 
+      if (Array.isArray(parsed)) {
 
+        this.snapshotStore.set(key, parsed.filter(point =>
 
+          point && Number.isFinite(Number(point.time)) && Number.isFinite(Number(point.c))
 
+        ).slice(-5000));
 
+      }
 
-  async getEquityDetails(symbol) {
+    } catch (error) {
 
+      console.warn(`⚠️ NSE snapshot restore failed for ${key}:`, error?.message || error);
 
+    }
 
-    const key = String(symbol).trim().toUpperCase();
+  }
 
-    const data = await this.live.callTool("cm_get_stock_quote", { symbol: key });
+  async saveSnapshots(symbol) {
 
-    const row = firstQuoteObject(data) || {};
+    const key = String(symbol).trim().toUpperCase();
 
+    if (!nseSnapshotRedis) return;
 
+    const list = this.snapshotStore.get(key) || [];
 
-    await this.loadSnapshots(key);
+    try {
 
-    await this.recordSnapshot(key, row);
+      await nseSnapshotRedis.set(
 
+        `ema360:nse:snapshots:${key}`,
 
+        JSON.stringify(list.slice(-5000)),
 
-    return {
+        "EX",
 
-      info: {
+        NSE_SNAPSHOT_TTL_SECONDS
 
-        companyName: row?.companyName || row?.company || row?.securityName || key
+      );
 
-      },
+    } catch (error) {
 
-      priceInfo: {
+      console.warn(`⚠️ NSE snapshot save failed for ${key}:`, error?.message || error);
 
-        lastPrice: quoteNumber(row, "lastPrice", "ltp", "last", "lastTradedPrice", "last_traded_price", "close"),
+    }
 
-        previousClose: quoteNumber(row, "previousClose", "prevClose", "previous_close"),
+  }
 
-        pChange: quoteNumber(row, "pChange", "percentChange", "pchange", "percent_change"),
+  async recordSnapshot(symbol, row) {
 
-        open: quoteNumber(row, "open"),
+    const key = String(symbol).trim().toUpperCase();
 
-        vwap: quoteNumber(row, "vwap"),
+    const price = quoteNumber(row, "lastPrice", "ltp", "last", "lastTradedPrice", "last_traded_price", "close");
 
-        intraDayHighLow: {
+    if (!Number.isFinite(price) || price <= 0) return;
 
-          max: quoteNumber(row, "dayHigh", "high"),
+    const now = Date.now();
 
-          min: quoteNumber(row, "dayLow", "low")
+    const previousSample = this.lastSampleAt.get(key) || 0;
 
-        }
+    if (now - previousSample < NSE_SAMPLE_MIN_GAP_MS) return;
 
-      },
+    this.lastSampleAt.set(key, now);
 
-      raw: row
+    const volume = quoteNumber(row, "totalTradedVolume", "totalTradedQty", "tradedVolume", "volume", "total_traded_volume");
 
-    };
+    const list = this.snapshotStore.get(key) || [];
 
-  }
+    list.push({
 
+      time: now,
 
+      c: price,
 
+      v: Number.isFinite(volume) ? volume : 0
 
+    });
 
+    const cutoff = now - 7 * 24 * 60 * 60 * 1000;
 
+    const trimmed = list.filter(x => Number(x.time) >= cutoff).slice(-5000);
 
-  async loadSnapshots(symbol) {
+    this.snapshotStore.set(key, trimmed);
 
-    const key = String(symbol).trim().toUpperCase();
+    // Persist without making the chart request wait for Redis.
 
-    if (this.snapshotLoaded.has(key)) return;
+    this.saveSnapshots(key).catch(() => undefined);
 
+  }
 
+  async getIntradayCandles(symbol, timeframe = "5m") {
 
-    this.snapshotLoaded.add(key);
+    const key = String(symbol).trim().toUpperCase();
 
+    const minutes = { "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60 }[timeframe];
 
+    if (!minutes) {
 
-    if (!nseSnapshotRedis) return;
+      throw new Error(`Unsupported NSE intraday timeframe: ${timeframe}`);
 
+    }
 
+    await this.loadSnapshots(key);
 
-    try {
+    // Sample the official NSE live quote at most once every 10 seconds.
 
-      const raw = await nseSnapshotRedis.get(`ema360:nse:snapshots:${key}`);
+    // This builds genuine intraday candles from real NSE snapshots.
 
-      if (!raw) return;
+    const lastSample = this.lastSampleAt.get(key) || 0;
 
+    if (Date.now() - lastSample >= NSE_SAMPLE_MIN_GAP_MS) {
 
+      await this.getEquityDetails(key);
 
-      const parsed = JSON.parse(raw);
+    }
 
-      if (Array.isArray(parsed)) {
+    const snapshots = this.snapshotStore.get(key) || [];
 
-        this.snapshotStore.set(key, parsed.filter(point =>
+    const buckets = new Map();
 
-          point && Number.isFinite(Number(point.time)) && Number.isFinite(Number(point.c))
+    for (const point of snapshots) {
 
-        ).slice(-5000));
+      const timestamp = Number(point.time);
 
-      }
+      const price = Number(point.c);
 
-    } catch (error) {
+      if (!Number.isFinite(timestamp) || !Number.isFinite(price)) continue;
 
-      console.warn(`⚠️ NSE snapshot restore failed for ${key}:`, error?.message || error);
+      const bucket = Math.floor(timestamp / (minutes * 60000)) * (minutes * 60000);
 
-    }
+      let candle = buckets.get(bucket);
 
-  }
+      if (!candle) {
 
+        candle = {
 
+          time: new Date(bucket).toISOString(),
 
-  async saveSnapshots(symbol) {
+          o: price,
 
-    const key = String(symbol).trim().toUpperCase();
+          h: price,
 
-    if (!nseSnapshotRedis) return;
+          l: price,
 
+          c: price,
 
+          v: 0,
 
-    const list = this.snapshotStore.get(key) || [];
+          _firstVolume: Number(point.v) || 0,
 
-    try {
+          _lastVolume: Number(point.v) || 0
 
-      await nseSnapshotRedis.set(
+        };
 
-        `ema360:nse:snapshots:${key}`,
+        buckets.set(bucket, candle);
 
-        JSON.stringify(list.slice(-5000)),
+      } else {
 
-        "EX",
+        candle.h = Math.max(candle.h, price);
 
-        NSE_SNAPSHOT_TTL_SECONDS
+        candle.l = Math.min(candle.l, price);
 
-      );
+        candle.c = price;
 
-    } catch (error) {
+        candle._lastVolume = Number(point.v) || candle._lastVolume;
 
-      console.warn(`⚠️ NSE snapshot save failed for ${key}:`, error?.message || error);
+      }
 
-    }
+    }
 
-  }
+    const candles = Array.from(buckets.values())
 
+      .sort((a, b) => new Date(a.time) - new Date(b.time))
 
+      .map(candle => ({
 
-  async recordSnapshot(symbol, row) {
+        time: candle.time,
 
-    const key = String(symbol).trim().toUpperCase();
+        o: candle.o,
 
-    const price = quoteNumber(row, "lastPrice", "ltp", "last", "lastTradedPrice", "last_traded_price", "close");
+        h: candle.h,
 
-    if (!Number.isFinite(price) || price <= 0) return;
+        l: candle.l,
 
+        c: candle.c,
 
+        v: Math.max(0, candle._lastVolume - candle._firstVolume)
 
-    const now = Date.now();
+      }));
 
-    const previousSample = this.lastSampleAt.get(key) || 0;
+    return candles;
 
-    if (now - previousSample < NSE_SAMPLE_MIN_GAP_MS) return;
+  }
 
+  async getEquityTradeInfo(symbol) {
 
+    const details = await this.getEquityDetails(symbol);
 
-    this.lastSampleAt.set(key, now);
+    const row = details.raw || {};
 
+    return { marketDeptOrderBook: { tradeInfo: { totalTradedVolume: row?.totalTradedVolume ?? row?.volume ?? row?.tradedVolume } } };
 
+  }
 
-    const volume = quoteNumber(row, "totalTradedVolume", "totalTradedQty", "tradedVolume", "volume", "total_traded_volume");
+  async getEquityStockIndices(indexName) {
 
-    const list = this.snapshotStore.get(key) || [];
-
-
-
-    list.push({
-
-      time: now,
-
-      c: price,
-
-      v: Number.isFinite(volume) ? volume : 0
-
-    });
-
-
-
-    const cutoff = now - 7 * 24 * 60 * 60 * 1000;
-
-    const trimmed = list.filter(x => Number(x.time) >= cutoff).slice(-5000);
-
-    this.snapshotStore.set(key, trimmed);
-
-
-
-    // Persist without making the chart request wait for Redis.
-
-    this.saveSnapshots(key).catch(() => undefined);
-
-  }
-
-
-
-
-
-
-
-  async getIntradayCandles(symbol, timeframe = "5m") {
-
-    const key = String(symbol).trim().toUpperCase();
-
-    const minutes = { "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60 }[timeframe];
-
-
-
-    if (!minutes) {
-
-      throw new Error(`Unsupported NSE intraday timeframe: ${timeframe}`);
-
-    }
-
-
-
-    await this.loadSnapshots(key);
-
-
-
-    // Sample the official NSE live quote at most once every 10 seconds.
-
-    // This builds genuine intraday candles from real NSE snapshots.
-
-    const lastSample = this.lastSampleAt.get(key) || 0;
-
-    if (Date.now() - lastSample >= NSE_SAMPLE_MIN_GAP_MS) {
-
-      await this.getEquityDetails(key);
-
-    }
-
-
-
-    const snapshots = this.snapshotStore.get(key) || [];
-
-    const buckets = new Map();
-
-
-
-    for (const point of snapshots) {
-
-      const timestamp = Number(point.time);
-
-      const price = Number(point.c);
-
-      if (!Number.isFinite(timestamp) || !Number.isFinite(price)) continue;
-
-
-
-      const bucket = Math.floor(timestamp / (minutes * 60000)) * (minutes * 60000);
-
-      let candle = buckets.get(bucket);
-
-
-
-      if (!candle) {
-
-        candle = {
-
-          time: new Date(bucket).toISOString(),
-
-          o: price,
-
-          h: price,
-
-          l: price,
-
-          c: price,
-
-          v: 0,
-
-          _firstVolume: Number(point.v) || 0,
-
-          _lastVolume: Number(point.v) || 0
-
-        };
-
-        buckets.set(bucket, candle);
-
-      } else {
-
-        candle.h = Math.max(candle.h, price);
-
-        candle.l = Math.min(candle.l, price);
-
-        candle.c = price;
-
-        candle._lastVolume = Number(point.v) || candle._lastVolume;
-
-      }
-
-    }
-
-
-
-    const candles = Array.from(buckets.values())
-
-      .sort((a, b) => new Date(a.time) - new Date(b.time))
-
-      .map(candle => ({
-
-        time: candle.time,
-
-        o: candle.o,
-
-        h: candle.h,
-
-        l: candle.l,
-
-        c: candle.c,
-
-        v: Math.max(0, candle._lastVolume - candle._firstVolume)
-
-      }));
-
-
-
-    return candles;
-
-  }
-
-
-
-
-
-
-
-  async getEquityTradeInfo(symbol) {
-
-
-
-    const details = await this.getEquityDetails(symbol);
-
-
-
-    const row = details.raw || {};
-
-
-
-    return { marketDeptOrderBook: { tradeInfo: { totalTradedVolume: row?.totalTradedVolume ?? row?.volume ?? row?.tradedVolume } } };
-
-
-
-  }
-
-
-
-
-
-
-
-  async getEquityStockIndices(indexName) {
-
-
-
-    const data = await this.callLiveMarket(indexName);
-
-
-
-    const rows = extractRows(data);
-
-
-
-    return { data: rows };
-
-
-
-  }
-
-
-
-
-
-
-
-  async getAllIndices() {
-
-
-
-    const names = [
-
-
-
-      "NIFTY 50",
-
-
-
-      "NIFTY BANK",
-
-
-
-      "NIFTY FIN SERVICE",
-
-
-
-      "NIFTY IT",
-
-
-
-      "NIFTY MIDCAP 100",
-
-
-
-      "NIFTY NEXT 50",
-
-
-
-      "NIFTY PHARMA",
-
-
-
-      "NIFTY SMLCAP 100"
-
-
-
-    ];
-
-
-
-    const rows = [];
-
-
-
-    for (const name of names) {
-
-
-
-      try {
-
-
-
-        const data = await this.callLiveMarket(name);
-
-
-
-        const found = extractRows(data);
-
-
-
-        if (found.length) {
-
-
-
-          const indexRow = found.find(row => {
-
-
-
-            const n = String(row?.index || row?.indexSymbol || row?.name || "").toUpperCase();
-
-
-
-            return n.includes(name.toUpperCase()) || name.toUpperCase().includes(n);
-
-
-
-          });
-
-
-
-          if (indexRow) rows.push(indexRow);
-
-
-
-        }
-
-
-
-      } catch (_) {}
-
-
-
-    }
-
-
-
-    return { data: rows };
-
-
-
-  }
-
-
-
-
-
-
-
-  async callLiveMarket(indexName) {
-
-
-
-    const tools = await this.live.listTools();
-
-
-
-    const tool = tools.find(t => t.name === "cm_get_live_market_data");
-
-
-
-    const schema = tool?.inputSchema || tool?.parameters || {};
-
-
-
-    const props = schema.properties || {};
-
-
-
-    const args = {};
-
-
-
-    const names = Object.keys(props);
-
-
-
-    if (names.length) {
-
-
-
-      const preferred = names.find(k => /index|symbol|variation|segment|name/i.test(k)) || names[0];
-
-
-
-      args[preferred] = indexName;
-
-
-
-    }
-
-
-
-    return this.live.callTool("cm_get_live_market_data", args);
-
-
-
-  }
-
-
-
-
-
-
-
-  async getEquityHistoricalData(symbol, { start, end }) {
-
-
-
-    const data = await this.history.callTool("get_stock_history", {
-
-
-
-      symbol: String(symbol).toUpperCase(),
-
-
-
-      startDate: start instanceof Date ? start.toISOString().slice(0, 10) : String(start),
-
-
-
-      endDate: end instanceof Date ? end.toISOString().slice(0, 10) : String(end)
-
-
-
-    });
-
-
-
-    const rows = extractRows(data);
-
-
-
-    return [{ data: rows }];
-
-
-
-  }
-
-
-
-
-
-
-
-  async getEquitySymbolInfo(symbol) {
-
-
-
-    const symbols = await this.getAllStockSymbols();
-
-
-
-    const normalized = String(symbol).trim().toUpperCase();
-
-
-
-    if (!symbols.includes(normalized)) return null;
-
-
-
-    return { scripcode: normalized, symbol: normalized };
-
-
-
-  }
-
-
-
-
-
-
-
-  async getIndexHistoricalData(symbol, { start, end }) {
-
-
-
-    const data = await this.history.callTool("get_stock_history", {
-
-
-
-      symbol: String(symbol).toUpperCase(),
-
-
-
-      startDate: start instanceof Date ? start.toISOString().slice(0, 10) : String(start),
-
-
-
-      endDate: end instanceof Date ? end.toISOString().slice(0, 10) : String(end)
-
-
-
-    });
-
-
-
-    return [{ data: extractRows(data) }];
-
-
-
-  }
-
-
-
-
-
-
-
-  async getEquityChartHistoricalData() {
-
-
-
-    throw new Error("NSE MCP does not provide intraday OHLC candles. EMA360 builds new intraday candles from the live NSE snapshot instead.");
-
-
-
-  }
-
-
-
-
-
-
-
-  async getIndexIntradayData(symbol) {
-    const indexName = String(symbol || "").trim().toUpperCase();
     const data = await this.callLiveMarket(indexName);
+
+    const rows = extractRows(data);
+
+    return { data: rows };
+
+  }
+
+  async getAllIndices() {
+
+    const names = [
+
+      "NIFTY 50",
+
+      "NIFTY BANK",
+
+      "NIFTY FIN SERVICE",
+
+      "NIFTY IT",
+
+      "NIFTY MIDCAP 100",
+
+      "NIFTY NEXT 50",
+
+      "NIFTY PHARMA",
+
+      "NIFTY SMLCAP 100"
+
+    ];
+
+    const rows = [];
+
+    for (const name of names) {
+
+      try {
+
+        const data = await this.callLiveMarket(name);
+
+        const found = extractRows(data);
+
+        if (found.length) {
+
+          const indexRow = found.find(row => {
+
+            const n = String(row?.index || row?.indexSymbol || row?.name || "").toUpperCase();
+
+            return n.includes(name.toUpperCase()) || name.toUpperCase().includes(n);
+
+          });
+
+          if (indexRow) rows.push(indexRow);
+
+        }
+
+      } catch (_) {}
+
+    }
+
+    return { data: rows };
+
+  }
+
+  async callLiveMarket(indexName) {
+
+    const tools = await this.live.listTools();
+
+    const tool = tools.find(t => t.name === "cm_get_live_market_data");
+
+    const schema = tool?.inputSchema || tool?.parameters || {};
+
+    const props = schema.properties || {};
+
+    const args = {};
+
+    const names = Object.keys(props);
+
+    if (names.length) {
+
+      const preferred = names.find(k => /index|symbol|variation|segment|name/i.test(k)) || names[0];
+
+      args[preferred] = indexName;
+
+    }
+
+    return this.live.callTool("cm_get_live_market_data", args);
+
+  }
+
+  async getEquityHistoricalData(symbol, { start, end }) {
+
+    const data = await this.history.callTool("get_stock_history", {
+
+      symbol: String(symbol).toUpperCase(),
+
+      startDate: start instanceof Date ? start.toISOString().slice(0, 10) : String(start),
+
+      endDate: end instanceof Date ? end.toISOString().slice(0, 10) : String(end)
+
+    });
+
+    const rows = extractRows(data);
+
+    return [{ data: rows }];
+
+  }
+
+  async getEquitySymbolInfo(symbol) {
+
+    const symbols = await this.getAllStockSymbols();
+
+    const normalized = String(symbol).trim().toUpperCase();
+
+    if (!symbols.includes(normalized)) return null;
+
+    return { scripcode: normalized, symbol: normalized };
+
+  }
+
+  async getIndexHistoricalData(symbol, { start, end }) {
+
+    const data = await this.history.callTool("get_stock_history", {
+
+      symbol: String(symbol).toUpperCase(),
+
+      startDate: start instanceof Date ? start.toISOString().slice(0, 10) : String(start),
+
+      endDate: end instanceof Date ? end.toISOString().slice(0, 10) : String(end)
+
+    });
+
+    return [{ data: extractRows(data) }];
+
+  }
+
+  async getEquityChartHistoricalData() {
+
+    throw new Error("NSE MCP does not provide intraday OHLC candles. EMA360 builds new intraday candles from the live NSE snapshot instead.");
+
+  }
+
+  async getIndexIntradayData(symbol) {
+
+    const indexName = String(symbol || "").trim().toUpperCase();
+
+    const data = await this.callLiveMarket(indexName);
+
     const row = firstQuoteObject(data) || {};
 
     const price = quoteNumber(row, "lastPrice", "ltp", "last", "indexValue", "currentValue", "value", "close");
+
     const previousClose = quoteNumber(row, "previousClose", "prevClose", "previous_close");
+
     const change = Number.isFinite(previousClose) && previousClose > 0 && Number.isFinite(price)
+
       ? ((price - previousClose) / previousClose) * 100
+
       : quoteNumber(row, "pChange", "percentChange", "percChange");
+
     const open = quoteNumber(row, "open");
+
     const high = quoteNumber(row, "dayHigh", "high");
+
     const low = quoteNumber(row, "dayLow", "low");
+
     const now = Date.now();
+
     const storeKey = `INDEX:${indexName}`;
 
     if (Number.isFinite(price) && price > 0) {
+
       await this.loadSnapshots(storeKey);
+
       const previousSample = this.lastSampleAt.get(storeKey) || 0;
+
       if (now - previousSample >= NSE_SAMPLE_MIN_GAP_MS) {
+
         this.lastSampleAt.set(storeKey, now);
+
         const list = this.snapshotStore.get(storeKey) || [];
+
         list.push({ time: now, c: price, v: 0 });
+
         const cutoff = now - 7 * 24 * 60 * 60 * 1000;
+
         this.snapshotStore.set(storeKey, list.filter(point => Number(point.time) >= cutoff).slice(-5000));
+
         this.saveSnapshots(storeKey).catch(() => undefined);
+
       }
+
     }
 
     return {
+
       grapthData: Number.isFinite(price) ? [[Math.floor(now / 1000), price]] : [],
+
       price, previousClose, change, open, high, low,
+
       timestamp: new Date(now).toISOString(), raw: row
+
     };
+
   }
 
   async getIndexIntradayCandles(symbol, timeframe = "5m") {
+
     const indexName = String(symbol || "").trim().toUpperCase();
+
     const minutes = { "1m":1, "3m":3, "5m":5, "15m":15, "30m":30, "1h":60 }[
+
       String(timeframe || "5m").trim().toLowerCase()
+
     ];
+
     if (!minutes) throw new Error(`Unsupported NSE index intraday timeframe: ${timeframe}`);
 
     await this.getIndexIntradayData(indexName);
 
     const snapshots = this.snapshotStore.get(`INDEX:${indexName}`) || [];
+
     const buckets = new Map();
+
     for (const point of snapshots) {
+
       const timestamp = Number(point.time);
+
       const price = Number(point.c);
+
       if (!Number.isFinite(timestamp) || !Number.isFinite(price)) continue;
+
       const bucket = Math.floor(timestamp / (minutes * 60000)) * (minutes * 60000);
+
       let candle = buckets.get(bucket);
+
       if (!candle) {
+
         candle = { time:new Date(bucket).toISOString(), o:price, h:price, l:price, c:price, v:0 };
+
         buckets.set(bucket,candle);
+
       } else {
+
         candle.h=Math.max(candle.h,price); candle.l=Math.min(candle.l,price); candle.c=price;
+
       }
+
     }
+
     return Array.from(buckets.values()).sort((a,b)=>new Date(a.time)-new Date(b.time));
+
   }
 
 }
-
-
-
-
-
-
 
 module.exports = { NseMcpClient };

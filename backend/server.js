@@ -4431,6 +4431,88 @@ function normalizeMarketCandleShape(candles) {
         );
 }
 
+function normalizeNseIndexChartPayload(payload) {
+    const candidates = [
+        payload?.data?.data,
+        payload?.data?.candles,
+        payload?.candles,
+        payload?.data,
+        payload
+    ];
+    const rows = candidates.find(Array.isArray) || [];
+
+    return rows.map(row => {
+        if (Array.isArray(row)) {
+            return {
+                time: row[0],
+                o: row[1],
+                h: row[2],
+                l: row[3],
+                c: row[4],
+                v: row[5] ?? 0
+            };
+        }
+        return {
+            time: row?.time ?? row?.t ?? row?.timestamp ?? row?.date ?? row?.datetime,
+            o: row?.o ?? row?.open,
+            h: row?.h ?? row?.high,
+            l: row?.l ?? row?.low,
+            c: row?.c ?? row?.close,
+            v: row?.v ?? row?.volume ?? 0
+        };
+    }).filter(candle => {
+        const time = candle.time;
+        const timeValid = Number.isFinite(Number(time)) || Number.isFinite(new Date(time).getTime());
+        return timeValid &&
+            Number.isFinite(Number(candle.o)) &&
+            Number.isFinite(Number(candle.h)) &&
+            Number.isFinite(Number(candle.l)) &&
+            Number.isFinite(Number(candle.c));
+    });
+}
+
+async function getNseIndexHistoricalCandles(timeframe = "5m") {
+    const config = {
+        "1m": { interval: "1", days: 5 },
+        "3m": { interval: "3", days: 15 },
+        "5m": { interval: "5", days: 30 },
+        "15m": { interval: "15", days: 90 },
+        "30m": { interval: "30", days: 120 },
+        "1h": { interval: "60", days: 365 }
+    }[String(timeframe || "5m").toLowerCase()];
+
+    if (!config) return [];
+
+    const end = new Date();
+    const start = new Date(end.getTime() - config.days * 24 * 60 * 60 * 1000);
+
+    // Use NSE's charting OHLC API for real historical index candles. This
+    // avoids depending on an in-memory snapshot store that is empty after a
+    // Render restart. If token lookup fails, the library is allowed to try
+    // its own symbol resolution before we fall back to MCP snapshots.
+    let token;
+    try {
+        const info = await nseIndia.getEquitySymbolInfo("NIFTY 50", "Index");
+        token = info?.scripCode ?? info?.scripcode ?? info?.scripcodeValue ?? info?.token;
+    } catch (error) {
+        console.warn("⚠️ NSE charting index token lookup failed; trying automatic resolution:", error?.message || error);
+    }
+
+    const response = await nseIndia.getEquityChartHistoricalData(
+        "NIFTY 50",
+        { start, end },
+        token,
+        "Index",
+        "I",
+        config.interval
+    );
+
+    const rows = normalizeNseIndexChartPayload(response);
+    const candles = normalizeMarketCandleShape(rows);
+    console.log("🇮🇳 NSE CHARTING INDEX CANDLES: NIFTY 50", timeframe, "candles =", candles.length);
+    return candles;
+}
+
 async function getNseMarketCandles(symbol, timeframe = "5m") {
     const normalizedSymbol = String(symbol || "")
         .trim()
@@ -4461,11 +4543,17 @@ async function getNseMarketCandles(symbol, timeframe = "5m") {
 
     try {
         if (normalizedSymbol === "NIFTY 50") {
-            const candles = await nseMcpClient.getIndexIntradayCandles(
-                "NIFTY 50",
-                tf
-            );
+            try {
+                const historicalCandles = await getNseIndexHistoricalCandles(tf);
+                if (historicalCandles.length) return historicalCandles;
+            } catch (chartError) {
+                console.warn(
+                    `⚠️ NSE charting historical candles unavailable for NIFTY 50 ${tf}; trying MCP snapshots:`,
+                    chartError?.message || chartError
+                );
+            }
 
+            const candles = await nseMcpClient.getIndexIntradayCandles("NIFTY 50", tf);
             console.log(
                 "🇮🇳 NSE MCP INDEX CANDLES:",
                 normalizedSymbol,
@@ -4473,7 +4561,6 @@ async function getNseMarketCandles(symbol, timeframe = "5m") {
                 "candles =",
                 Array.isArray(candles) ? candles.length : 0
             );
-
             return normalizeMarketCandleShape(candles || []);
         }
 
@@ -4514,7 +4601,7 @@ async function getNseMarketCandles(symbol, timeframe = "5m") {
 
 const NSE_MARKET_QUOTE_CACHE = new Map();
 const NSE_MARKET_QUOTE_INFLIGHT = new Map();
-const NSE_MARKET_QUOTE_CACHE_MS = 1000;
+const NSE_MARKET_QUOTE_CACHE_MS = 5000;
 
 function nseWebHeaders(symbol) {
     return {
@@ -4724,7 +4811,7 @@ function normalizeNseIndexConstituentRows(payload) {
     return quotes;
 }
 
-async function fetchNseNifty50Quotes() {
+async function refreshNseNifty50Quotes() {
     const now = Date.now();
 
     if (
@@ -4753,29 +4840,42 @@ async function fetchNseNifty50Quotes() {
     ];
 
     const quotes = {};
+    let consecutiveFailures = 0;
 
     for (const symbol of symbols) {
         try {
             const quote = await fetchNseMarketQuote(symbol);
             if (quote && Number.isFinite(Number(quote.price))) {
                 quotes[symbol] = quote;
+                consecutiveFailures = 0;
+            } else {
+                consecutiveFailures++;
             }
         } catch (error) {
+            consecutiveFailures++;
             console.warn(
                 `⚠️ NSE MCP constituent quote unavailable for ${symbol}:`,
                 error?.message || error
             );
         }
+        // If the upstream is timing out repeatedly, stop the batch instead
+        // of queuing many identical calls behind the same broken service.
+        if (consecutiveFailures >= 2) {
+            console.warn("⚠️ Stopping NSE quote batch after two consecutive upstream failures.");
+            break;
+        }
     }
 
-    try {
-        const niftyQuote = await fetchNseMarketQuote("NIFTY 50");
-        if (niftyQuote) quotes["NIFTY 50"] = niftyQuote;
-    } catch (error) {
-        console.warn(
-            "⚠️ NSE MCP NIFTY 50 quote unavailable:",
-            error?.message || error
-        );
+    if (consecutiveFailures < 2) {
+        try {
+            const niftyQuote = await fetchNseMarketQuote("NIFTY 50");
+            if (niftyQuote) quotes["NIFTY 50"] = niftyQuote;
+        } catch (error) {
+            console.warn(
+                "⚠️ NSE MCP NIFTY 50 quote unavailable:",
+                error?.message || error
+            );
+        }
     }
 
     if (!Object.keys(quotes).length) {
@@ -4788,6 +4888,49 @@ async function fetchNseNifty50Quotes() {
     };
 
     return quotes;
+}
+
+const NSE_QUOTES_FRESH_MS = 10000;
+const NSE_QUOTES_STALE_MAX_MS = 120000;
+const NSE_BATCH_WAIT_MS = 9000;
+let NSE_NIFTY50_QUOTES_INFLIGHT = null;
+
+function waitForNseBatch(promise, timeoutMs, label) {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+        promise.then(
+            value => { clearTimeout(timer); resolve(value); },
+            error => { clearTimeout(timer); reject(error); }
+        );
+    });
+}
+
+async function fetchNseNifty50Quotes() {
+    const now = Date.now();
+    const hasCache = Object.keys(NSE_NIFTY50_QUOTES_CACHE.quotes || {}).length > 0;
+    const age = hasCache ? now - NSE_NIFTY50_QUOTES_CACHE.timestamp : Infinity;
+
+    if (hasCache && age < NSE_QUOTES_FRESH_MS) return NSE_NIFTY50_QUOTES_CACHE.quotes;
+
+    if (!NSE_NIFTY50_QUOTES_INFLIGHT) {
+        NSE_NIFTY50_QUOTES_INFLIGHT = refreshNseNifty50Quotes()
+            .finally(() => { NSE_NIFTY50_QUOTES_INFLIGHT = null; });
+        // A stale cache can be served immediately while a single refresh runs.
+        if (hasCache && age <= NSE_QUOTES_STALE_MAX_MS) {
+            NSE_NIFTY50_QUOTES_INFLIGHT.catch(error => console.warn("⚠️ Background NSE quote refresh failed:", error?.message || error));
+            return NSE_NIFTY50_QUOTES_CACHE.quotes;
+        }
+    }
+
+    try {
+        return await waitForNseBatch(NSE_NIFTY50_QUOTES_INFLIGHT, NSE_BATCH_WAIT_MS, "NSE quotes batch");
+    } catch (error) {
+        if (hasCache && age <= NSE_QUOTES_STALE_MAX_MS) {
+            console.warn("⚠️ Serving recent cached NSE quotes after refresh failure:", error?.message || error);
+            return NSE_NIFTY50_QUOTES_CACHE.quotes;
+        }
+        throw error;
+    }
 }
 
 app.get("/api/market/nse/quotes", async (req, res) => {
@@ -4971,7 +5114,7 @@ function findMcpQuoteObject(value, depth = 0) {
     return null;
 }
 
-async function fetchNseHeaderIndices() {
+async function refreshNseHeaderIndices() {
     const now = Date.now();
 
     if (
@@ -4994,6 +5137,7 @@ async function fetchNseHeaderIndices() {
     ];
 
     const output = {};
+    let consecutiveFailures = 0;
 
     for (const [label, nseName] of indexNames) {
         try {
@@ -5032,16 +5176,22 @@ async function fetchNseHeaderIndices() {
                 change: Number.isFinite(change) ? change : null,
                 timestamp: new Date().toISOString()
             };
+            consecutiveFailures = 0;
         } catch (error) {
+            consecutiveFailures++;
             console.warn(
                 `⚠️ NSE MCP header index failed for ${label}:`,
                 error?.message || error
             );
         }
+        if (consecutiveFailures >= 2) {
+            console.warn("⚠️ Stopping NSE index batch after two consecutive upstream failures.");
+            break;
+        }
     }
 
     // EMA360's former SENSEX slot is now RELIANCE in NSE-only mode.
-    try {
+    if (consecutiveFailures < 2) try {
         const reliance = await fetchNseMarketQuote("RELIANCE");
         if (reliance) {
             output.RELIANCE = {
@@ -5070,6 +5220,37 @@ async function fetchNseHeaderIndices() {
     };
 
     return output;
+}
+
+const NSE_INDICES_FRESH_MS = 10000;
+const NSE_INDICES_STALE_MAX_MS = 120000;
+let NSE_HEADER_INDICES_INFLIGHT = null;
+
+async function fetchNseHeaderIndices() {
+    const now = Date.now();
+    const hasCache = Object.keys(NSE_HEADER_INDICES_CACHE.indices || {}).length > 0;
+    const age = hasCache ? now - NSE_HEADER_INDICES_CACHE.timestamp : Infinity;
+
+    if (hasCache && age < NSE_INDICES_FRESH_MS) return NSE_HEADER_INDICES_CACHE.indices;
+
+    if (!NSE_HEADER_INDICES_INFLIGHT) {
+        NSE_HEADER_INDICES_INFLIGHT = refreshNseHeaderIndices()
+            .finally(() => { NSE_HEADER_INDICES_INFLIGHT = null; });
+        if (hasCache && age <= NSE_INDICES_STALE_MAX_MS) {
+            NSE_HEADER_INDICES_INFLIGHT.catch(error => console.warn("⚠️ Background NSE indices refresh failed:", error?.message || error));
+            return NSE_HEADER_INDICES_CACHE.indices;
+        }
+    }
+
+    try {
+        return await waitForNseBatch(NSE_HEADER_INDICES_INFLIGHT, NSE_BATCH_WAIT_MS, "NSE indices batch");
+    } catch (error) {
+        if (hasCache && age <= NSE_INDICES_STALE_MAX_MS) {
+            console.warn("⚠️ Serving recent cached NSE indices after refresh failure:", error?.message || error);
+            return NSE_HEADER_INDICES_CACHE.indices;
+        }
+        throw error;
+    }
 }
 
 app.get("/api/market/nse/indices", async (req, res) => {
