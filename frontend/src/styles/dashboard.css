@@ -5211,74 +5211,24 @@ footer {
   animation-play-state: paused;
 }
 
-
-.ema360-market-ticker {
-  width: 100%;
-  height: 55px;
-  overflow: hidden;
-  position: relative;
-  background: #004b5b;
-  border-bottom: 1px solid #087b8b;
-}
-
-.ema360-market-ticker .ema360-ticker-track {
-  display: flex;
-  width: max-content;
-  min-width: max-content;
-  height: 100%;
-  animation: ema360-ticker-scroll 120s linear infinite;
-  will-change: transform;
-}
-
-.ema360-market-ticker:hover .ema360-ticker-track {
-  animation-play-state: paused;
-}
-
+/* Positive movement — GREEN */
 .ema360-ticker-value.up,
 .ema360-ticker-change.up {
   color: #19e3a0 !important;
 }
 
+/* Negative movement — RED */
 .ema360-ticker-value.down,
 .ema360-ticker-change.down {
   color: #ff6679 !important;
 }
 
+/* No change or unavailable change — NEUTRAL */
 .ema360-ticker-value.flat,
 .ema360-ticker-value.neutral,
 .ema360-ticker-change.flat {
   color: #b8c8d3 !important;
 }
-
-.ema360-ticker-symbol {
-  color: #effaff;
-}
-
-.ema360-ticker-price {
-  color: #f1fbff;
-}
-
-@keyframes ema360-ticker-scroll {
-  from { transform: translateX(0); }
-  to { transform: translateX(-50%); }
-}
-
-
-/* Positive percentage: GREEN */
-.ema360-ticker-change.up {
-  color: #19e3a0 !important;
-}
-
-/* Negative percentage: RED */
-.ema360-ticker-change.down {
-  color: #ff6679 !important;
-}
-
-/* Zero or missing percentage: GRAY */
-.ema360-ticker-change.flat {
-  color: #b8c8d3 !important;
-}
-
 
 /* Stock names */
 .ema360-ticker-symbol {
