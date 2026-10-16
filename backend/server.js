@@ -2937,40 +2937,148 @@ function keepOnlyCompletedCandles(candles, timeframe) {
 // FETCH NSE CANDLES FOR SELECTED TIMEFRAME
 // ------------------------------------------------------------
 async function getNseCandles(symbol, timeframe = "5m", includeIncomplete = false) {
-    const requested = String(symbol || "").trim().toUpperCase();
-    const tf = String(timeframe || "5m").trim().toLowerCase();
-    if (!requested) return [];
-
-    // IMPORTANT: Do not call stock-nse-india / www.nseindia.com from Render.
-    // Render's outbound IP is currently receiving HTTP 403. Use NSE's MCP
-    // live quote snapshots instead, which are also used by the market cards.
-    const nseSymbol = requested === "TATAMOTORS" ? "TMPV" : requested;
     try {
-        let candles;
-        if (["1m", "3m", "5m", "15m", "30m", "1h"].includes(tf)) {
-            candles = requested === "NIFTY 50"
-                ? await nseMcpClient.getIndexIntradayCandles("NIFTY 50", tf)
-                : await nseMcpClient.getIntradayCandles(nseSymbol, tf);
-        } else if (["1d", "1D", "D"].includes(tf)) {
-            const end = new Date();
-            const start = new Date(end.getTime() - 1000 * 24 * 60 * 60 * 1000);
-            const response = requested === "NIFTY 50"
-                ? await nseMcpClient.getIndexHistoricalData("NIFTY 50", { start, end })
-                : await nseMcpClient.getEquityHistoricalData(nseSymbol, { start, end });
-            candles = normalizeNseCandles(response);
-        } else {
-            throw new Error(`Unsupported NSE timeframe: ${timeframe}`);
+        const token = await getNseToken(symbol);
+
+        console.log(
+            "DIAGNOSTIC TOKEN:",
+            symbol,
+            "=>",
+            token
+        );
+
+        if (!token) {
+            console.log(
+                "❌ NO NSE TOKEN FOR:",
+                symbol
+            );
+
+            return [];
         }
 
-        const normalized = normalizeMarketCandleShape(candles || []);
-        console.log(
-            "🇮🇳 NSE MCP candles:", requested, tf,
-            "count =", normalized.length,
-            "latest =", normalized.at(-1)?.time || "none"
+        /*
+         * Large warm-up windows are intentional. Chartink calculates
+         * indicators from a historical intraday series; using only the
+         * latest 10 days can make EMA20 differ at the latest candle.
+         */
+        const timeframeConfig = {
+            "1m": {
+                interval: 1,
+                days: 15
+            },
+
+            "3m": {
+                interval: 3,
+                days: 30
+            },
+
+            "5m": {
+                interval: 5,
+                days: 60
+            },
+
+            "15m": {
+                interval: 15,
+                days: 120
+            },
+
+            "30m": {
+                interval: 30,
+                days: 180
+            },
+
+            "1h": {
+                interval: 60,
+                days: 365
+            },
+
+            "1d": {
+                interval: "D",
+                days: 1000
+            }
+        };
+
+        const config = timeframeConfig[timeframe];
+
+        if (!config) {
+            throw new Error(
+                `Unsupported NSE timeframe: ${timeframe}`
+            );
+        }
+
+        const now = new Date();
+
+        const start = new Date(
+            now.getTime() -
+            config.days * 24 * 60 * 60 * 1000
         );
-        return includeIncomplete ? normalized : keepOnlyCompletedCandles(normalized, tf);
+
+        const response =
+            await nseIndia.getEquityChartHistoricalData(
+                symbol,
+                {
+                    start,
+                    end: now,
+                },
+                token,
+                "Equity",
+                "I",
+                config.interval
+            );
+
+        console.log(
+            "NSE RAW RESPONSE:",
+            symbol,
+            "type =",
+            Array.isArray(response)
+                ? "ARRAY"
+                : typeof response,
+            "length =",
+            Array.isArray(response)
+                ? response.length
+                : Array.isArray(response?.data)
+                    ? response.data.length
+                    : "NO DATA ARRAY"
+        );
+
+        const candles = normalizeNseCandles(response);
+
+        console.log(
+            "NSE NORMALIZED:",
+            symbol,
+            "candles =",
+            candles.length
+        );
+
+        if (candles.length > 0) {
+            console.log(
+                "NSE FIRST CANDLE:",
+                candles[0]
+            );
+
+            console.log(
+                "NSE LAST CANDLE:",
+                candles[candles.length - 1]
+            );
+        }
+
+        // Normal scanner behavior:
+        // only completed candles are returned.
+        //
+        // Diagnostic mode:
+        // return the raw NSE series, including the latest
+        // possibly-incomplete candle.
+        return includeIncomplete
+            ? candles
+            : keepOnlyCompletedCandles(candles, timeframe);
+
     } catch (error) {
-        console.error(`NSE MCP candle fetch failed for ${requested} ${tf}:`, error?.message || error);
+
+        console.log(
+            `NSE ${timeframe} candle fetch failed for ${symbol}:`,
+            error.message
+        );
+
         return [];
     }
 }
@@ -4364,15 +4472,45 @@ function normalizeNseIndexChartPayload(payload) {
 }
 
 async function getNseIndexHistoricalCandles(timeframe = "5m") {
+    const config = {
+        "1m": { interval: "1", days: 5 },
+        "3m": { interval: "3", days: 15 },
+        "5m": { interval: "5", days: 30 },
+        "15m": { interval: "15", days: 90 },
+        "30m": { interval: "30", days: 120 },
+        "1h": { interval: "60", days: 365 }
+    }[String(timeframe || "5m").toLowerCase()];
+
+    if (!config) return [];
+
+    const end = new Date();
+    const start = new Date(end.getTime() - config.days * 24 * 60 * 60 * 1000);
+
+    // Use NSE's charting OHLC API for real historical index candles. This
+    // avoids depending on an in-memory snapshot store that is empty after a
+    // Render restart. If token lookup fails, the library is allowed to try
+    // its own symbol resolution before we fall back to MCP snapshots.
+    let token;
     try {
-        const candles = await nseMcpClient.getIndexIntradayCandles("NIFTY 50", timeframe);
-        const normalized = normalizeMarketCandleShape(candles || []);
-        console.log("🇮🇳 NSE MCP INDEX CANDLES: NIFTY 50", timeframe, "candles =", normalized.length);
-        return normalized;
+        const info = await nseIndia.getEquitySymbolInfo("NIFTY 50", "Index");
+        token = info?.scripCode ?? info?.scripcode ?? info?.scripcodeValue ?? info?.token;
     } catch (error) {
-        console.error("NSE MCP index candle fetch failed:", error?.message || error);
-        return [];
+        console.warn("⚠️ NSE charting index token lookup failed; trying automatic resolution:", error?.message || error);
     }
+
+    const response = await nseIndia.getEquityChartHistoricalData(
+        "NIFTY 50",
+        { start, end },
+        token,
+        "Index",
+        "I",
+        config.interval
+    );
+
+    const rows = normalizeNseIndexChartPayload(response);
+    const candles = normalizeMarketCandleShape(rows);
+    console.log("🇮🇳 NSE CHARTING INDEX CANDLES: NIFTY 50", timeframe, "candles =", candles.length);
+    return candles;
 }
 
 async function getNseMarketCandles(symbol, timeframe = "5m") {
@@ -4458,6 +4596,16 @@ const NSE_MARKET_QUOTE_CACHE = new Map();
 const NSE_MARKET_QUOTE_INFLIGHT = new Map();
 const NSE_MARKET_QUOTE_CACHE_MS = 5000;
 
+function nseWebHeaders(symbol) {
+    return {
+        "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer":
+            `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(symbol)}`,
+        "Accept-Language": "en-US,en;q=0.9"
+    };
+}
 
 async function fetchNseMarketQuote(symbol) {
     const requestedSymbol = String(symbol || "").trim().toUpperCase();
@@ -4471,41 +4619,47 @@ async function fetchNseMarketQuote(symbol) {
     const request = (async () => {
         try {
             let result;
-            // IMPORTANT: use the NSE MCP client here. stock-nse-india calls
-            // www.nseindia.com directly and gets HTTP 403 from Render.
-            const nseSymbol = requestedSymbol === "TATAMOTORS" ? "TMPV" : requestedSymbol;
-            const details = await withNseTimeout(
-                nseMcpClient.getEquityDetails(nseSymbol),
-                12000,
-                `NSE MCP ${nseSymbol} quote`
-            );
-            const priceInfo = details?.priceInfo || {};
-            const raw = details?.raw || {};
-            const price = pickNumber(
-                priceInfo.lastPrice, raw.lastPrice, raw.ltp, raw.last,
-                raw.lastTradedPrice, raw.last_traded_price, raw.close
-            );
-            const previousClose = pickNumber(
-                priceInfo.previousClose, raw.previousClose, raw.prevClose,
-                raw.previous_close
-            );
-            if (!(Number.isFinite(price) && price > 0)) {
-                throw new Error(`NSE MCP returned no valid price for ${requestedSymbol}`);
+            if (requestedSymbol === "NIFTY 50") {
+                const details = await withNseTimeout(
+                    nseIndia.getIndexIntradayData("NIFTY 50"), 8000, "NSE NIFTY 50 quote"
+                );
+                const price = pickNumber(details?.price, details?.lastPrice, details?.last, details?.indexValue);
+                const previousClose = pickNumber(details?.previousClose, details?.prevClose);
+                const change = pickNumber(details?.change, details?.pChange, details?.percentChange);
+                if (!(Number.isFinite(price) && price > 0)) throw new Error("Official NSE response contained no valid NIFTY 50 price");
+                result = {
+                    source: "NSE", symbol: requestedSymbol, price,
+                    previousClose: Number.isFinite(previousClose) ? previousClose : null,
+                    change: Number.isFinite(change) ? change : null,
+                    volume: null,
+                    open: pickNumber(details?.open), high: pickNumber(details?.high), low: pickNumber(details?.low),
+                    timestamp: details?.timestamp || new Date().toISOString()
+                };
+            } else {
+                const nseSymbol = requestedSymbol === "TATAMOTORS" ? "TMPV" : requestedSymbol;
+                const details = await withNseTimeout(
+                    nseIndia.getEquityDetails(nseSymbol), 8000, `NSE ${nseSymbol} quote`
+                );
+                const priceInfo = details?.priceInfo || details?.data?.priceInfo || {};
+                const price = pickNumber(priceInfo.lastPrice, details?.lastPrice, details?.last, details?.price);
+                const previousClose = pickNumber(priceInfo.previousClose, details?.previousClose, details?.prevClose);
+                if (!(Number.isFinite(price) && price > 0)) throw new Error(`Official NSE response contained no valid price for ${requestedSymbol}`);
+                const change = Number.isFinite(previousClose) && previousClose > 0
+                    ? ((price - previousClose) / previousClose) * 100
+                    : pickNumber(priceInfo.pChange, details?.pChange, details?.percentChange);
+                const raw = details?.metadata || details?.raw || details?.data || {};
+                result = {
+                    source: "NSE", symbol: requestedSymbol, nseSymbol, price,
+                    previousClose: Number.isFinite(previousClose) ? previousClose : null,
+                    change: Number.isFinite(change) ? change : null,
+                    volume: pickNumber(raw?.totalTradedVolume, raw?.totalTradedQty, raw?.tradedVolume, raw?.volume),
+                    open: pickNumber(priceInfo.open, details?.open),
+                    high: pickNumber(priceInfo.intraDayHighLow?.max, details?.dayHigh, details?.high),
+                    low: pickNumber(priceInfo.intraDayHighLow?.min, details?.dayLow, details?.low),
+                    vwap: pickNumber(priceInfo.vwap, details?.vwap),
+                    timestamp: new Date().toISOString()
+                };
             }
-            const change = Number.isFinite(previousClose) && previousClose > 0
-                ? ((price - previousClose) / previousClose) * 100
-                : pickNumber(priceInfo.pChange, raw.pChange, raw.percentChange, raw.pchange);
-            result = {
-                source: "NSE", symbol: requestedSymbol, nseSymbol, price,
-                previousClose: Number.isFinite(previousClose) ? previousClose : null,
-                change: Number.isFinite(change) ? change : null,
-                volume: pickNumber(raw.totalTradedVolume, raw.totalTradedQty, raw.tradedVolume, raw.volume),
-                open: pickNumber(priceInfo.open, raw.open),
-                high: pickNumber(priceInfo.intraDayHighLow?.max, raw.dayHigh, raw.high),
-                low: pickNumber(priceInfo.intraDayHighLow?.min, raw.dayLow, raw.low),
-                vwap: pickNumber(priceInfo.vwap, raw.vwap),
-                timestamp: new Date().toISOString()
-            };
             NSE_MARKET_QUOTE_CACHE.set(requestedSymbol, { timestamp: Date.now(), data: result });
             return result;
         } finally {
@@ -4608,60 +4762,14 @@ function normalizeNseIndexConstituentRows(payload) {
 }
 
 async function refreshNseNifty50Quotes() {
-    // Do not call www.nseindia.com directly here: Render's outbound IP can be
-    // blocked with 403 even when the same code worked earlier in the day.
-    // First ask the official NSE MCP live-market tool for the NIFTY 50 rows.
-    let quotes = {};
-    try {
-        const payload = await withNseTimeout(
-            nseMcpClient.getEquityStockIndices("NIFTY 50"),
-            20000,
-            "NSE MCP NIFTY 50 constituents"
-        );
-        quotes = normalizeNseIndexConstituentRows(payload);
-    } catch (error) {
-        console.warn("NSE MCP NIFTY 50 constituent snapshot unavailable; using per-symbol NSE MCP quotes:", error?.message || error);
-    }
-
-    // Some MCP responses return the index itself rather than its constituents.
-    // In that case, fetch the dashboard's NIFTY 50 symbols through MCP, never
-    // through the blocked www.nseindia.com REST endpoint. Limit concurrency.
-    if (Object.keys(quotes).length < 10) {
-        const symbols = [
-            "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-            "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL",
-            "CIPLA", "COALINDIA", "DRREDDY", "EICHERMOT", "ETERNAL", "GRASIM",
-            "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO",
-            "HINDUNILVR", "ICICIBANK", "INDUSINDBK", "INFY", "ITC", "JIOFIN",
-            "JSWSTEEL", "KOTAKBANK", "LT", "M&M", "MARUTI", "MAXHEALTH",
-            "NESTLEIND", "NTPC", "ONGC", "POWERGRID", "RELIANCE", "SBILIFE",
-            "SBIN", "SHRIRAMFIN", "SUNPHARMA", "TATACONSUM", "TMPV",
-            "TATASTEEL", "TCS", "TECHM", "TITAN", "TRENT", "ULTRACEMCO"
-        ];
-        const mcpQuotes = {};
-        // NseMcpConnection serializes requests internally; a small worker pool
-        // avoids creating a burst of simultaneous sessions/requests.
-        let cursor = 0;
-        const worker = async () => {
-            while (cursor < symbols.length) {
-                const symbol = symbols[cursor++];
-                try {
-                    const quote = await fetchNseMarketQuote(symbol === "TMPV" ? "TATAMOTORS" : symbol);
-                    if (quote && Number.isFinite(Number(quote.price)) && Number(quote.price) > 0) {
-                        mcpQuotes[symbol === "TMPV" ? "TATAMOTORS" : symbol] = quote;
-                    }
-                } catch (error) {
-                    // One unavailable symbol must not blank the entire market table.
-                    console.warn(`NSE MCP quote unavailable for ${symbol}:`, error?.message || error);
-                }
-            }
-        };
-        await Promise.all(Array.from({ length: 3 }, worker));
-        quotes = { ...quotes, ...mcpQuotes };
-    }
-
+    // NSE's index constituent endpoint returns the full NIFTY 50 table in one
+    // response. Calling cm_get_stock_quote once per symbol serialized 11 MCP
+    // requests and routinely hit the 9-second route timeout.
+    const url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050";
+    const payload = await withNseTimeout(nseIndia.getData(url, "nse"), 8000, "NSE NIFTY 50 constituents");
+    const quotes = normalizeNseIndexConstituentRows(payload);
     if (!Object.keys(quotes).length) {
-        throw new Error("NSE MCP returned no valid NIFTY 50 constituent quotes");
+        throw new Error("Official NSE constituent response contained no valid stock prices");
     }
     NSE_NIFTY50_QUOTES_CACHE = { timestamp: Date.now(), quotes };
     return quotes;
@@ -4829,7 +4937,7 @@ async function fetchNseAllIndices() {
         return NSE_ALL_INDICES_CACHE.data;
     }
 
-    const data = await nseMcpClient.getAllIndices();
+    const data = await nseIndia.getAllIndices();
 
     NSE_ALL_INDICES_CACHE = {
         timestamp: Date.now(),
@@ -4894,7 +5002,7 @@ function findMcpQuoteObject(value, depth = 0) {
 async function refreshNseHeaderIndices() {
     // Fetch the official NSE indices payload once. Do not serially query the
     // MCP service for each index; that queue caused all header requests to time out.
-    const payload = await withNseTimeout(nseMcpClient.getAllIndices(), 20000, "NSE MCP all-indices request");
+    const payload = await withNseTimeout(nseIndia.getAllIndices(), 8000, "NSE all-indices request");
     const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
     const output = {};
 
