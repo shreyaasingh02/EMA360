@@ -5211,6 +5211,52 @@ footer {
   animation-play-state: paused;
 }
 
+/* Positive movement — GREEN */
+.ema360-ticker-value.up,
+.ema360-ticker-change.up {
+  color: #19e3a0 !important;
+}
+
+/* Negative movement — RED */
+.ema360-ticker-value.down,
+.ema360-ticker-change.down {
+  color: #ff6679 !important;
+}
+
+/* No change or unavailable change — NEUTRAL */
+.ema360-ticker-value.flat,
+.ema360-ticker-value.neutral,
+.ema360-ticker-change.flat {
+  color: #b8c8d3 !important;
+}
+
+/* Stock names */
+.ema360-ticker-symbol {
+  color: #effaff;
+  font-weight: 800;
+}
+
+/* Prices */
+.ema360-ticker-price {
+  color: #f1fbff;
+  font-weight: 700;
+}
+
+/* Change percentage */
+.ema360-ticker-value small,
+.ema360-ticker-change {
+  font-weight: 700;
+}
+
+/* Keep right-to-left scrolling */
+.ema360-market-ticker .ema360-ticker-track {
+  animation: ema360-ticker-scroll 120s linear infinite;
+}
+
+.ema360-market-ticker:hover .ema360-ticker-track {
+  animation-play-state: paused;
+}
+
 @keyframes ema360-ticker-scroll {
   from {
     transform: translateX(0);
