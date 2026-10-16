@@ -37,18 +37,69 @@ function num(...values) {
   }
   return null;
 }
+
 function priceOf(item) {
   if (!item || typeof item !== "object") return num(item);
-  const direct = num(item.price, item.ltp, item.lastPrice, item.indexValue,
-    item.currentValue, item.close, item.c, item.last);
-  if (direct !== null) return direct;
-  const history = item.candles || item.data || item.history;
-  if (Array.isArray(history) && history.length) {
+
+  // Direct quote/index values
+  const direct = num(
+    item.price,
+    item.ltp,
+    item.lastPrice,
+    item.indexValue,
+    item.currentValue,
+    item.close,
+    item.c,
+    item.last
+  );
+
+  if (direct !== null && direct > 0) return direct;
+
+  // Handle stockData[symbol][timeframe] candle structure
+  const histories = [
+    item["1M"],
+    item["3M"],
+    item["5M"],
+    item["15M"],
+    item["30M"],
+    item["1H"],
+    item["1D"],
+    item.candles,
+    item.data,
+    item.history
+  ];
+
+  let newestCandle = null;
+
+  for (const history of histories) {
+    if (!Array.isArray(history) || !history.length) continue;
+
     const last = history[history.length - 1];
-    return num(last?.c, last?.close, last?.ltp, last?.price, last?.[4]);
+    if (!last) continue;
+
+    const lastTime = new Date(last.time).getTime();
+    const newestTime = newestCandle
+      ? new Date(newestCandle.time).getTime()
+      : -Infinity;
+
+    if (!newestCandle || lastTime > newestTime) {
+      newestCandle = last;
+    }
   }
+
+  if (newestCandle) {
+    return num(
+      newestCandle.c,
+      newestCandle.close,
+      newestCandle.ltp,
+      newestCandle.price,
+      newestCandle[4]
+    );
+  }
+
   return null;
 }
+
 function changeOf(item, price) {
   if (!item || typeof item !== "object") return null;
   const percent = num(item.changePercent, item.pChange, item.percentChange,
