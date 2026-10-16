@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import MarketTicker from "./MarketTicker";
 
 function Header({
   selectedStock,
@@ -527,68 +528,21 @@ function Header({
       </div>
 
 
+      
       {/* =====================================================
-          MARKET TICKER
+          SCROLLING MARKET TICKER
       ===================================================== */}
 
-      <div className="ema360-market-ticker">
-        <div className="ticker-track">
-          {marketSymbols.map((item) => {
-            const data = getMarketData(item.keys);
+      <MarketTicker
+        stocks={stocks}
+        stockData={stockData}
+        marketQuotes={marketQuotes}
+        marketIndices={marketIndices}
+        selectedStock={selectedStock}
+        onStockChange={onStockChange}
+        session={session}
+      />
 
-            const price = data?.price ?? null;
-            const change = data?.change ?? null;
-            const percent = data?.percent ?? null;
-
-            const isNegative = change !== null && change < 0;
-
-            return (
-              <button
-                key={item.label}
-                className={`ticker-item ${selectedStock === item.label ? "ticker-selected" : ""
-                  }`}
-                onClick={() => onStockChange(item.label)}
-              >
-                <span className="ticker-name">
-                  {item.label}
-                </span>
-
-                <div className="ticker-values">
-                  <span
-                    className={`ticker-price ${isNegative ? "negative" : "positive"
-                      }`}
-                  >
-                    {price !== null
-                      ? Number(price).toLocaleString("en-IN", {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2,
-                      })
-                      : "--"}
-                  </span>
-
-                  <span
-                    className={`ticker-change ${isNegative ? "negative" : "positive"
-                      }`}
-                  >
-                    {change !== null
-                      ? `${change >= 0 ? "+" : ""}${change.toFixed(2)}`
-                      : "--"}
-                  </span>
-
-                  <span
-                    className={`ticker-change ${isNegative ? "negative" : "positive"
-                      }`}
-                  >
-                    {percent !== null
-                      ? `(${percent >= 0 ? "+" : ""}${percent.toFixed(2)}%)`
-                      : ""}
-                  </span>
-                </div>
-              </button>
-            );
-          })}
-        </div>
-      </div>
 
     </header>
   );

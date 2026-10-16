@@ -5066,3 +5066,104 @@ footer {
 }
 
 .login-field{display:flex;flex-direction:column;gap:7px;width:100%;margin-top:12px}.login-field>span{font-size:12px;font-weight:700;color:rgba(255,255,255,.72)}.login-field input{width:100%;box-sizing:border-box;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.055);color:#fff;border-radius:12px;padding:13px 14px;outline:none;font:inherit}.login-field input:focus{border-color:rgba(247,184,74,.75);box-shadow:0 0 0 3px rgba(247,184,74,.10)}.login-field input::placeholder{color:rgba(255,255,255,.36)}.password-wrap{position:relative;width:100%}.password-wrap input{padding-right:70px}.password-toggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);border:0;background:transparent;color:#f7b84a;font-size:12px;font-weight:700;cursor:pointer}.connection-card .angel-button{margin-top:16px}
+
+
+/* Place directly below the existing EMA360 top navigation. */
+.ema360-market-ticker {
+  position: relative;
+  z-index: 5;
+  height: 55px;
+  width: 100%;
+  overflow: hidden;
+  background: #004b5b;
+  border-bottom: 1px solid #087b8b;
+  isolation: isolate;
+}
+.ema360-market-ticker::before,
+.ema360-market-ticker::after {
+  content: "";
+  position: absolute;
+  z-index: 2;
+  top: 0;
+  bottom: 0;
+  width: 26px;
+  pointer-events: none;
+}
+.ema360-market-ticker::before {
+  left: 0;
+  background: linear-gradient(90deg, #004b5b, transparent);
+}
+.ema360-market-ticker::after {
+  right: 0;
+  background: linear-gradient(270deg, #004b5b, transparent);
+}
+.ema360-ticker-track {
+  display: flex;
+  width: max-content;
+  min-width: max-content;
+  height: 100%;
+  animation: ema360-ticker-scroll 78s linear infinite;
+  will-change: transform;
+}
+.ema360-market-ticker:hover .ema360-ticker-track {
+  animation-play-state: paused;
+}
+.ema360-ticker-group {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  height: 100%;
+}
+.ema360-ticker-item {
+  display: flex;
+  flex: 0 0 198px;
+  min-width: 160px;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  padding: 6px 18px;
+  border: 0;
+  border-right: 1px solid #ffffff0c;
+  background: transparent;
+  color: #f1fbff;
+  text-align: left;
+  cursor: pointer;
+}
+.ema360-ticker-item:hover { background: #006172; }
+.ema360-ticker-symbol {
+  overflow: hidden;
+  color: #effaff;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ema360-ticker-value {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+.ema360-ticker-value small { font-size: 10px; font-weight: 600; }
+.ema360-ticker-value.up { color: #19e3a0; }
+.ema360-ticker-value.down { color: #ff6679; }
+.ema360-ticker-value.flat,
+.ema360-ticker-value.neutral { color: #b8c8d3; }
+@keyframes ema360-ticker-scroll {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ema360-ticker-track { animation: none; }
+}
+@media (max-width: 1000px) {
+  .ema360-ticker-item { flex-basis: 170px; padding: 6px 12px; }
+}
+@media (max-width: 600px) {
+  .ema360-market-ticker { height: 51px; }
+  .ema360-ticker-item { flex-basis: 150px; min-width: 150px; padding: 5px 10px; }
+}
