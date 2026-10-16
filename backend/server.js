@@ -4599,6 +4599,16 @@ async function getNseMarketCandles(symbol, timeframe = "5m") {
    Angel One is completely untouched.
 ============================================================ */
 
+function withNseTimeout(promise, timeoutMs, label) {
+    let timer;
+    return Promise.race([
+        Promise.resolve(promise),
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+        })
+    ]).finally(() => clearTimeout(timer));
+}
+
 const NSE_MARKET_QUOTE_CACHE = new Map();
 const NSE_MARKET_QUOTE_INFLIGHT = new Map();
 const NSE_MARKET_QUOTE_CACHE_MS = 5000;
@@ -4615,107 +4625,64 @@ function nseWebHeaders(symbol) {
 }
 
 async function fetchNseMarketQuote(symbol) {
-    const requestedSymbol = String(symbol || "")
-        .trim()
-        .toUpperCase();
-
-    if (!requestedSymbol) {
-        throw new Error("Symbol is required");
-    }
+    const requestedSymbol = String(symbol || "").trim().toUpperCase();
+    if (!requestedSymbol) throw new Error("Symbol is required");
 
     const cached = NSE_MARKET_QUOTE_CACHE.get(requestedSymbol);
-    if (
-        cached &&
-        Date.now() - cached.timestamp < NSE_MARKET_QUOTE_CACHE_MS
-    ) {
-        return cached.data;
-    }
-
+    if (cached && Date.now() - cached.timestamp < NSE_MARKET_QUOTE_CACHE_MS) return cached.data;
     const existing = NSE_MARKET_QUOTE_INFLIGHT.get(requestedSymbol);
     if (existing) return existing;
 
     const request = (async () => {
         try {
             let result;
-
             if (requestedSymbol === "NIFTY 50") {
-                const details = await nseMcpClient.getIndexIntradayData("NIFTY 50");
-                const price = Number(details?.price);
-                const previousClose = Number(details?.previousClose);
-                const change = Number(details?.change);
-
-                if (!Number.isFinite(price) || price <= 0) {
-                    throw new Error("NSE MCP did not return NIFTY 50 price");
-                }
-
+                const details = await withNseTimeout(
+                    nseIndia.getIndexIntradayData("NIFTY 50"), 8000, "NSE NIFTY 50 quote"
+                );
+                const price = pickNumber(details?.price, details?.lastPrice, details?.last, details?.indexValue);
+                const previousClose = pickNumber(details?.previousClose, details?.prevClose);
+                const change = pickNumber(details?.change, details?.pChange, details?.percentChange);
+                if (!(Number.isFinite(price) && price > 0)) throw new Error("Official NSE response contained no valid NIFTY 50 price");
                 result = {
-                    source: "NSE",
-                    symbol: requestedSymbol,
-                    price,
+                    source: "NSE", symbol: requestedSymbol, price,
                     previousClose: Number.isFinite(previousClose) ? previousClose : null,
                     change: Number.isFinite(change) ? change : null,
                     volume: null,
-                    open: Number.isFinite(Number(details?.open)) ? Number(details.open) : null,
-                    high: Number.isFinite(Number(details?.high)) ? Number(details.high) : null,
-                    low: Number.isFinite(Number(details?.low)) ? Number(details.low) : null,
+                    open: pickNumber(details?.open), high: pickNumber(details?.high), low: pickNumber(details?.low),
                     timestamp: details?.timestamp || new Date().toISOString()
                 };
             } else {
-                const nseSymbol = requestedSymbol === "TATAMOTORS"
-                    ? "TMPV"
-                    : requestedSymbol;
-
-                const details = await nseMcpClient.getEquityDetails(nseSymbol);
-                const priceInfo = details?.priceInfo || {};
-                const price = Number(priceInfo.lastPrice);
-                const previousClose = Number(priceInfo.previousClose);
-
-                if (!Number.isFinite(price) || price <= 0) {
-                    throw new Error(
-                        `NSE MCP did not return current price for ${requestedSymbol} (${nseSymbol})`
-                    );
-                }
-
-                const change =
-                    Number.isFinite(previousClose) && previousClose > 0
-                        ? ((price - previousClose) / previousClose) * 100
-                        : Number(priceInfo.pChange);
-
-                const raw = details?.raw || {};
-                const volume = [
-                    raw?.totalTradedVolume,
-                    raw?.totalTradedQty,
-                    raw?.tradedVolume,
-                    raw?.volume
-                ].map(Number).find(Number.isFinite);
-
+                const nseSymbol = requestedSymbol === "TATAMOTORS" ? "TMPV" : requestedSymbol;
+                const details = await withNseTimeout(
+                    nseIndia.getEquityDetails(nseSymbol), 8000, `NSE ${nseSymbol} quote`
+                );
+                const priceInfo = details?.priceInfo || details?.data?.priceInfo || {};
+                const price = pickNumber(priceInfo.lastPrice, details?.lastPrice, details?.last, details?.price);
+                const previousClose = pickNumber(priceInfo.previousClose, details?.previousClose, details?.prevClose);
+                if (!(Number.isFinite(price) && price > 0)) throw new Error(`Official NSE response contained no valid price for ${requestedSymbol}`);
+                const change = Number.isFinite(previousClose) && previousClose > 0
+                    ? ((price - previousClose) / previousClose) * 100
+                    : pickNumber(priceInfo.pChange, details?.pChange, details?.percentChange);
+                const raw = details?.metadata || details?.raw || details?.data || {};
                 result = {
-                    source: "NSE",
-                    symbol: requestedSymbol,
-                    nseSymbol,
-                    price,
+                    source: "NSE", symbol: requestedSymbol, nseSymbol, price,
                     previousClose: Number.isFinite(previousClose) ? previousClose : null,
                     change: Number.isFinite(change) ? change : null,
-                    volume: Number.isFinite(volume) ? volume : null,
-                    open: Number(priceInfo.open) || null,
-                    high: Number(priceInfo.intraDayHighLow?.max) || null,
-                    low: Number(priceInfo.intraDayHighLow?.min) || null,
-                    vwap: Number(priceInfo.vwap) || null,
+                    volume: pickNumber(raw?.totalTradedVolume, raw?.totalTradedQty, raw?.tradedVolume, raw?.volume),
+                    open: pickNumber(priceInfo.open, details?.open),
+                    high: pickNumber(priceInfo.intraDayHighLow?.max, details?.dayHigh, details?.high),
+                    low: pickNumber(priceInfo.intraDayHighLow?.min, details?.dayLow, details?.low),
+                    vwap: pickNumber(priceInfo.vwap, details?.vwap),
                     timestamp: new Date().toISOString()
                 };
             }
-
-            NSE_MARKET_QUOTE_CACHE.set(requestedSymbol, {
-                timestamp: Date.now(),
-                data: result
-            });
-
+            NSE_MARKET_QUOTE_CACHE.set(requestedSymbol, { timestamp: Date.now(), data: result });
             return result;
         } finally {
             NSE_MARKET_QUOTE_INFLIGHT.delete(requestedSymbol);
         }
     })();
-
     NSE_MARKET_QUOTE_INFLIGHT.set(requestedSymbol, request);
     return request;
 }
@@ -4812,86 +4779,21 @@ function normalizeNseIndexConstituentRows(payload) {
 }
 
 async function refreshNseNifty50Quotes() {
-    const now = Date.now();
-
-    if (
-        NSE_NIFTY50_QUOTES_CACHE.timestamp &&
-        now - NSE_NIFTY50_QUOTES_CACHE.timestamp < 10000 &&
-        Object.keys(NSE_NIFTY50_QUOTES_CACHE.quotes).length
-    ) {
-        return NSE_NIFTY50_QUOTES_CACHE.quotes;
-    }
-
-    // The old implementation used stock-nse-india's bulk endpoint. That
-    // endpoint is the one returning 403 on Render. Use the official NSE MCP
-    // individual quote tool instead. Keep this deliberately small and
-    // cached; the selected-stock quote route remains the primary live path.
-    const symbols = [
-        "RELIANCE",
-        "HDFCBANK",
-        "ICICIBANK",
-        "INFY",
-        "TCS",
-        "SBIN",
-        "BHARTIARTL",
-        "ITC",
-        "LT",
-        "TATAMOTORS"
-    ];
-
-    const quotes = {};
-    let consecutiveFailures = 0;
-
-    for (const symbol of symbols) {
-        try {
-            const quote = await fetchNseMarketQuote(symbol);
-            if (quote && Number.isFinite(Number(quote.price))) {
-                quotes[symbol] = quote;
-                consecutiveFailures = 0;
-            } else {
-                consecutiveFailures++;
-            }
-        } catch (error) {
-            consecutiveFailures++;
-            console.warn(
-                `⚠️ NSE MCP constituent quote unavailable for ${symbol}:`,
-                error?.message || error
-            );
-        }
-        // If the upstream is timing out repeatedly, stop the batch instead
-        // of queuing many identical calls behind the same broken service.
-        if (consecutiveFailures >= 2) {
-            console.warn("⚠️ Stopping NSE quote batch after two consecutive upstream failures.");
-            break;
-        }
-    }
-
-    if (consecutiveFailures < 2) {
-        try {
-            const niftyQuote = await fetchNseMarketQuote("NIFTY 50");
-            if (niftyQuote) quotes["NIFTY 50"] = niftyQuote;
-        } catch (error) {
-            console.warn(
-                "⚠️ NSE MCP NIFTY 50 quote unavailable:",
-                error?.message || error
-            );
-        }
-    }
-
+    // NSE's index constituent endpoint returns the full NIFTY 50 table in one
+    // response. Calling cm_get_stock_quote once per symbol serialized 11 MCP
+    // requests and routinely hit the 9-second route timeout.
+    const url = "https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050";
+    const payload = await withNseTimeout(nseIndia.getData(url, "nse"), 8000, "NSE NIFTY 50 constituents");
+    const quotes = normalizeNseIndexConstituentRows(payload);
     if (!Object.keys(quotes).length) {
-        throw new Error("NSE MCP returned no constituent quotes");
+        throw new Error("Official NSE constituent response contained no valid stock prices");
     }
-
-    NSE_NIFTY50_QUOTES_CACHE = {
-        timestamp: Date.now(),
-        quotes
-    };
-
+    NSE_NIFTY50_QUOTES_CACHE = { timestamp: Date.now(), quotes };
     return quotes;
 }
 
 const NSE_QUOTES_FRESH_MS = 10000;
-const NSE_QUOTES_STALE_MAX_MS = 120000;
+const NSE_QUOTES_STALE_MAX_MS = 20000;
 const NSE_BATCH_WAIT_MS = 9000;
 let NSE_NIFTY50_QUOTES_INFLIGHT = null;
 
@@ -5115,115 +5017,60 @@ function findMcpQuoteObject(value, depth = 0) {
 }
 
 async function refreshNseHeaderIndices() {
-    const now = Date.now();
-
-    if (
-        NSE_HEADER_INDICES_CACHE.timestamp &&
-        now - NSE_HEADER_INDICES_CACHE.timestamp < 5000 &&
-        Object.keys(NSE_HEADER_INDICES_CACHE.indices).length
-    ) {
-        return NSE_HEADER_INDICES_CACHE.indices;
-    }
-
-    const indexNames = [
-        ["BANKNIFTY", "NIFTY BANK"],
-        ["FINNIFTY", "NIFTY FIN SERVICE"],
-        ["NIFTY 50", "NIFTY 50"],
-        ["NIFTYIT", "NIFTY IT"],
-        ["NIFTYMIDCAP100", "NIFTY MIDCAP 100"],
-        ["NIFTYNXT50", "NIFTY NEXT 50"],
-        ["NIFTYPHARMA", "NIFTY PHARMA"],
-        ["NIFTYSMALL100", "NIFTY SMLCAP 100"]
-    ];
-
+    // Fetch the official NSE indices payload once. Do not serially query the
+    // MCP service for each index; that queue caused all header requests to time out.
+    const payload = await withNseTimeout(nseIndia.getAllIndices(), 8000, "NSE all-indices request");
+    const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : [];
     const output = {};
-    let consecutiveFailures = 0;
 
-    for (const [label, nseName] of indexNames) {
-        try {
-            const payload = await nseMcpClient.callLiveMarket(nseName);
-            const row = findMcpQuoteObject(payload);
-            if (!row) continue;
-
-            const price = pickNumber(
-                row?.lastPrice,
-                row?.ltp,
-                row?.last,
-                row?.indexValue,
-                row?.currentValue,
-                row?.value,
-                row?.close
-            );
-
-            if (!Number.isFinite(price)) continue;
-
-            const previousClose = pickNumber(
-                row?.previousClose,
-                row?.prevClose,
-                row?.previous_close
-            );
-
-            const change =
-                Number.isFinite(previousClose) && previousClose > 0
-                    ? ((price - previousClose) / previousClose) * 100
-                    : pickNumber(row?.pChange, row?.percentChange, row?.percChange);
-
-            output[label] = {
-                source: "NSE",
-                name: label,
-                price,
-                previousClose: Number.isFinite(previousClose) ? previousClose : null,
-                change: Number.isFinite(change) ? change : null,
-                timestamp: new Date().toISOString()
-            };
-            consecutiveFailures = 0;
-        } catch (error) {
-            consecutiveFailures++;
-            console.warn(
-                `⚠️ NSE MCP header index failed for ${label}:`,
-                error?.message || error
-            );
-        }
-        if (consecutiveFailures >= 2) {
-            console.warn("⚠️ Stopping NSE index batch after two consecutive upstream failures.");
-            break;
-        }
-    }
-
-    // EMA360's former SENSEX slot is now RELIANCE in NSE-only mode.
-    if (consecutiveFailures < 2) try {
-        const reliance = await fetchNseMarketQuote("RELIANCE");
-        if (reliance) {
-            output.RELIANCE = {
-                source: "NSE",
-                name: "RELIANCE",
-                price: reliance.price,
-                previousClose: reliance.previousClose,
-                change: reliance.change,
-                timestamp: reliance.timestamp
-            };
-        }
-    } catch (error) {
-        console.warn(
-            "⚠️ NSE MCP header RELIANCE quote failed:",
-            error?.message || error
-        );
-    }
-
-    if (!Object.keys(output).length) {
-        throw new Error("NSE MCP returned no header index data");
-    }
-
-    NSE_HEADER_INDICES_CACHE = {
-        timestamp: Date.now(),
-        indices: output
+    const aliases = {
+        BANKNIFTY: ["NIFTY BANK", "BANKNIFTY"],
+        FINNIFTY: ["NIFTY FIN SERVICE", "NIFTY FINANCIAL SERVICES", "FINNIFTY"],
+        "NIFTY 50": ["NIFTY 50", "NIFTY"],
+        NIFTYIT: ["NIFTY IT", "NIFTYIT"],
+        NIFTYMIDCAP100: ["NIFTY MIDCAP 100", "NIFTY MIDCAP 100"],
+        NIFTYNXT50: ["NIFTY NEXT 50", "NIFTYNXT50"],
+        NIFTYPHARMA: ["NIFTY PHARMA", "NIFTYPHARMA"],
+        NIFTYSMALL100: ["NIFTY SMLCAP 100", "NIFTY SMALLCAP 100", "NIFTYSMALL100"]
     };
 
+    for (const [label, names] of Object.entries(aliases)) {
+        const wanted = names.map(x => x.toUpperCase());
+        const row = rows.find(item => wanted.includes(String(item?.index || item?.indexSymbol || item?.name || "").trim().toUpperCase()));
+        if (!row) continue;
+        const price = pickNumber(row?.last, row?.lastPrice, row?.ltp, row?.close, row?.indexValue);
+        if (!(Number.isFinite(price) && price > 0)) continue;
+        const previousClose = pickNumber(row?.previousClose, row?.prevClose, row?.previous_close);
+        const change = Number.isFinite(previousClose) && previousClose > 0
+            ? ((price - previousClose) / previousClose) * 100
+            : pickNumber(row?.percentChange, row?.pChange, row?.variation);
+        output[label] = {
+            source: "NSE", name: label, price,
+            previousClose: Number.isFinite(previousClose) ? previousClose : null,
+            change: Number.isFinite(change) ? change : null,
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    // The existing header has a RELIANCE slot; fill it only with a verified NSE quote.
+    try {
+        const reliance = await fetchNseMarketQuote("RELIANCE");
+        output.RELIANCE = {
+            source: "NSE", name: "RELIANCE", price: reliance.price,
+            previousClose: reliance.previousClose, change: reliance.change,
+            timestamp: reliance.timestamp
+        };
+    } catch (error) {
+        console.warn("NSE RELIANCE header quote unavailable:", error?.message || error);
+    }
+
+    if (!Object.keys(output).length) throw new Error("Official NSE all-indices response contained no valid index prices");
+    NSE_HEADER_INDICES_CACHE = { timestamp: Date.now(), indices: output };
     return output;
 }
 
 const NSE_INDICES_FRESH_MS = 10000;
-const NSE_INDICES_STALE_MAX_MS = 120000;
+const NSE_INDICES_STALE_MAX_MS = 20000;
 let NSE_HEADER_INDICES_INFLIGHT = null;
 
 async function fetchNseHeaderIndices() {
