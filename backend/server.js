@@ -4526,67 +4526,50 @@ async function getNseMarketCandles(symbol, timeframe = "5m") {
         "1m", "3m", "5m", "15m", "30m", "1h"
     ]);
 
-    if (!intradayTimeframes.has(tf)) {
-        // Keep the existing NSE daily path for 1D only. Intraday guest
-        // market data is handled exclusively by the official NSE MCP below.
-        return normalizeMarketCandleShape(
-            await getNseCandles(normalizedSymbol, tf, true)
-        );
-    }
-
-    // NSE changed Tata Motors' current traded symbol to TMPV.
-    // EMA360 keeps TATAMOTORS as its UI symbol and translates only at the
-    // data boundary.
-    const mcpSymbol = normalizedSymbol === "TATAMOTORS"
+    // NSE changed Tata Motors' current traded symbol to TMPV. Keep the UI
+    // symbol stable and translate only at the NSE data boundary.
+    const nseSymbol = normalizedSymbol === "TATAMOTORS"
         ? "TMPV"
         : normalizedSymbol;
 
-    try {
-        if (normalizedSymbol === "NIFTY 50") {
-            try {
-                const historicalCandles = await getNseIndexHistoricalCandles(tf);
-                if (historicalCandles.length) return historicalCandles;
-            } catch (chartError) {
-                console.warn(
-                    `⚠️ NSE charting historical candles unavailable for NIFTY 50 ${tf}; trying MCP snapshots:`,
-                    chartError?.message || chartError
-                );
-            }
-
-            const candles = await nseMcpClient.getIndexIntradayCandles("NIFTY 50", tf);
-            console.log(
-                "🇮🇳 NSE MCP INDEX CANDLES:",
-                normalizedSymbol,
-                tf,
-                "candles =",
-                Array.isArray(candles) ? candles.length : 0
-            );
-            return normalizeMarketCandleShape(candles || []);
-        }
-
-        const candles = await nseMcpClient.getIntradayCandles(
-            mcpSymbol,
-            tf
-        );
-
-        console.log(
-            "🇮🇳 NSE MCP CANDLES:",
-            normalizedSymbol,
-            "->",
-            mcpSymbol,
-            tf,
-            "candles =",
-            Array.isArray(candles) ? candles.length : 0
-        );
-
-        return normalizeMarketCandleShape(candles || []);
-    } catch (error) {
-        console.error(
-            `❌ NSE MCP candle fetch failed for ${normalizedSymbol} (${mcpSymbol}) ${tf}:`,
-            error?.stack || error?.message || error
-        );
-        return [];
+    // Use the same official NSE chart endpoint used by the NSE scanner for
+    // equities. MCP snapshot candles may be sparse or left over from an older
+    // process, which caused the all-stocks table to remain in Loading state.
+    if (!intradayTimeframes.has(tf)) {
+        const dailyCandles = await getNseCandles(nseSymbol, tf, true);
+        return normalizeMarketCandleShape(dailyCandles || []);
     }
+
+    if (normalizedSymbol === "NIFTY 50") {
+        // Do not fall back to MCP's in-memory index snapshots when historical
+        // NSE chart data is unavailable; that can silently return old candles.
+        const candles = await getNseIndexHistoricalCandles(tf);
+        if (!candles.length) {
+            throw new Error(`No fresh NSE chart candles returned for NIFTY 50 ${tf}`);
+        }
+        return candles;
+    }
+
+    const candles = await getNseCandles(nseSymbol, tf, true);
+    const normalized = normalizeMarketCandleShape(candles || []);
+
+    console.log(
+        "🇮🇳 OFFICIAL NSE CHART CANDLES:",
+        normalizedSymbol,
+        "->",
+        nseSymbol,
+        tf,
+        "candles =",
+        normalized.length,
+        "latest =",
+        normalized.at(-1)?.time || "none"
+    );
+
+    if (!normalized.length) {
+        throw new Error(`No NSE chart candles returned for ${normalizedSymbol} ${tf}`);
+    }
+
+    return normalized;
 }
 
 /* ============================================================
