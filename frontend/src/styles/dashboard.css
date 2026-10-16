@@ -5148,15 +5148,15 @@ footer {
 }
 
 .ema360-ticker-change.up {
-  color: #19e3a0 !important;
+  color: green !important;
 }
 
 .ema360-ticker-change.down {
-  color: #ff6679 !important;
+  color: red !important;
 }
 
 .ema360-ticker-change.flat {
-  color: #b8c8d3 !important;
+  color: white !important;
 }
 
 .ema360-ticker-selected {

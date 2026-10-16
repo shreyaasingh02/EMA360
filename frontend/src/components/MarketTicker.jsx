@@ -138,6 +138,8 @@ function MarketTicker({
             ? [...quoteRows(marketQuotes), ...candleRows(stockData)]
             : [...quoteRows(marketIndices), ...quoteRows(marketQuotes)];
 
+            console.log("Ticker source:", isAngel ? "Angel One" : "NSE");
+console.log("Ticker raw rows:", rawRows.slice(0, 5));
         const bySymbol = new Map();
         for (const row of rawRows) {
             const key = normalizeSymbol(row.symbol);
