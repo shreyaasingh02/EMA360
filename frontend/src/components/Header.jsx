@@ -5,6 +5,7 @@ function Header({
   selectedStock,
   stocks = [],
   stockData = {},
+  dataVersion = 0,
   marketQuotes = {},
   marketIndices = {},
   activePage,
