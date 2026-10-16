@@ -5102,7 +5102,7 @@ footer {
   width: max-content;
   min-width: max-content;
   height: 100%;
-  animation: ema360-ticker-scroll 78s linear infinite;
+  animation: ema360-ticker-scroll 120s linear infinite;
   will-change: transform;
 }
 .ema360-market-ticker:hover .ema360-ticker-track {
