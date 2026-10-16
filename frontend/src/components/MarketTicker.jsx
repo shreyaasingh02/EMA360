@@ -131,6 +131,13 @@ function MarketTicker({
     selectedStock, onStockChange, session = null, dataVersion = 0
 }) {
     const isAngel = session?.dataSource === "angel";
+    console.log("TICKER INPUTS", {
+  source: session?.dataSource,
+  stockDataKeys: Object.keys(stockData || {}),
+  marketQuoteKeys: Object.keys(marketQuotes || {}),
+  marketIndexKeys: Object.keys(marketIndices || {}),
+  dataVersion
+});
 
     const rows = useMemo(() => {
         // Strict source separation: no NSE fallback in Angel One mode.
