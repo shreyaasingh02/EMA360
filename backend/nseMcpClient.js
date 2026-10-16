@@ -145,17 +145,57 @@ function parseSse(text) {
 }
 
 async function readResponse(response) {
-
-  const text = await response.text();
-
-  if (!text) return null;
-
   const type = String(response.headers.get("content-type") || "").toLowerCase();
 
-  if (type.includes("text/event-stream")) return parseSse(text);
+  // Streamable HTTP MCP servers may keep an SSE response open after sending
+  // the JSON-RPC result. Do not call response.text() on that live stream:
+  // it waits for EOF and causes every quote to time out.
+  if (type.includes("text/event-stream") && response.body?.getReader) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (value) buffer += decoder.decode(value, { stream: !done });
 
+        let boundary;
+        while ((boundary = buffer.search(/\r?\n\r?\n/)) >= 0) {
+          const block = buffer.slice(0, boundary);
+          const separator = buffer.slice(boundary).match(/^\r?\n\r?\n/)[0];
+          buffer = buffer.slice(boundary + separator.length);
+          const data = block.split(/\r?\n/)
+            .filter(line => line.startsWith("data:"))
+            .map(line => line.slice(5).trimStart())
+            .join("\n");
+          if (!data || data === "[DONE]") continue;
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed && typeof parsed === "object") {
+              await reader.cancel().catch(() => {});
+              return parsed;
+            }
+          } catch (_) {}
+        }
+        if (done) break;
+      }
+      // Some servers send a single JSON payload without the final blank line.
+      const trailing = buffer.split(/\r?\n/)
+        .filter(line => line.startsWith("data:"))
+        .map(line => line.slice(5).trimStart())
+        .join("\n");
+      if (trailing) {
+        try { return JSON.parse(trailing); } catch (_) {}
+      }
+      return null;
+    } finally {
+      try { await reader.cancel(); } catch (_) {}
+    }
+  }
+
+  const text = await response.text();
+  if (!text) return null;
   try { return JSON.parse(text); } catch (_) { return parseSse(text); }
-
 }
 
 class NseMcpConnection {
@@ -215,57 +255,43 @@ class NseMcpConnection {
   }
 
   async rawRequest(method, params) {
-
     const id = this.nextId++;
-
     const headers = {
-
       "Content-Type": "application/json",
-
       "Accept": "application/json, text/event-stream"
-
     };
-
     if (this.sessionId) headers["Mcp-Session-Id"] = this.sessionId;
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    let response;
+    const timeout = setTimeout(() => controller.abort(), 12000);
     try {
-      response = await fetch(this.url, {
+      const response = await fetch(this.url, {
         method: "POST",
         headers,
         body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
         signal: controller.signal
       });
+
+      const sid = response.headers.get("mcp-session-id");
+      if (sid) this.sessionId = sid;
+
+      const payload = await readResponse(response);
+      if (!response.ok) {
+        const message = payload?.error?.message || payload?.message || `NSE MCP HTTP ${response.status}`;
+        throw new Error(message);
+      }
+      return payload;
     } catch (error) {
       if (error?.name === "AbortError") {
         this.initialized = false;
         this.sessionId = null;
         this.tools = null;
-        throw new Error(`NSE MCP request timed out after 8000ms (${method})`);
+        throw new Error(`NSE MCP request timed out after 12000ms (${method})`);
       }
       throw error;
     } finally {
       clearTimeout(timeout);
     }
-
-    const sid = response.headers.get("mcp-session-id");
-
-    if (sid) this.sessionId = sid;
-
-    const payload = await readResponse(response);
-
-    if (!response.ok) {
-
-      const message = payload?.error?.message || payload?.message || `NSE MCP HTTP ${response.status}`;
-
-      throw new Error(message);
-
-    }
-
-    return payload;
-
   }
 
   async rawNotification(method, params) {
