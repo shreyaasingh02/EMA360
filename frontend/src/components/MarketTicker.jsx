@@ -60,76 +60,70 @@ function candleRows(stockData = {}) {
 }
 
 
+
 function quoteRows(source = {}) {
-  return Object.entries(source || {}).map(([key, quote]) => {
-    if (!quote || typeof quote !== "object") return null;
+  return Object.entries(source || {})
+    .map(([key, quote]) => {
+      if (!quote || typeof quote !== "object") return null;
 
-    const symbol = quote.symbol || quote.name || key;
+      const symbol = quote.symbol || quote.name || key;
 
-    const price = toNumber(
-      quote.price,
-      quote.ltp,
-      quote.lastPrice,
-      quote.last_traded_price
-    );
+      const price = toNumber(
+        quote.price,
+        quote.ltp,
+        quote.lastPrice,
+        quote.last_traded_price
+      );
 
-    const previousClose = toNumber(
-      quote.previousClose,
-      quote.prevClose,
-      quote.previous_close,
-      quote.close
-    );
+      const previousClose = toNumber(
+        quote.previousClose,
+        quote.prevClose,
+        quote.previous_close
+      );
 
-    const rawChange = toNumber(quote.change);
+      const rawChange = toNumber(quote.change);
 
-    // Calculate the absolute price change when both prices are available.
-    const change =
-      price != null &&
-      previousClose != null &&
-      previousClose > 0
-        ? price - previousClose
-        : rawChange != null && quote.changeIsPercent === false
-          ? rawChange
-          : null;
-
-    // Calculate percentage from actual prices when possible.
-    let percent =
-      price != null &&
-      previousClose != null &&
-      previousClose > 0
-        ? ((price - previousClose) / previousClose) * 100
-        : null;
-
-    // Otherwise use the source's explicit percentage field.
-    if (percent == null) {
-      percent = toNumber(
+      const explicitPercent = toNumber(
         quote.percent,
         quote.percentChange,
-        quote.pChange
+        quote.changePercent,
+        quote.percentageChange,
+        quote.change_pct,
+        quote.pChange,
+        quote.pchange
       );
-    }
 
-    // The existing NSE API's `change` field represents percentage change.
-    if (
-      percent == null &&
-      rawChange != null &&
-      quote.changeIsPercent !== false
-    ) {
-      percent = rawChange;
-    }
+      let change = null;
+      let percent = explicitPercent;
 
-    return {
-      symbol: String(symbol),
-      price,
-      change,
-      percent,
-      volume: toNumber(
-        quote.volume,
-        quote.totalTradedVolume
-      ) ?? 0
-    };
-  }).filter(Boolean);
+      if (price != null && previousClose != null && previousClose > 0) {
+        change = price - previousClose;
+        percent = (change / previousClose) * 100;
+      } else if (rawChange != null) {
+        if (quote.changeIsPercent === true) {
+          percent = rawChange;
+        } else if (quote.changeIsPercent === false) {
+          change = rawChange;
+        } else if (percent == null) {
+          // Use the API's `change` only if its documented meaning is percent.
+          percent = rawChange;
+        }
+      }
+
+      return {
+        symbol: String(symbol),
+        price,
+        change,
+        percent,
+        volume: toNumber(
+          quote.volume,
+          quote.totalTradedVolume
+        ) ?? 0
+      };
+    })
+    .filter(Boolean);
 }
+
 
 
 function MarketTicker({
