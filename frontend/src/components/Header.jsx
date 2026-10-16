@@ -533,15 +533,25 @@ function Header({
           SCROLLING MARKET TICKER
       ===================================================== */}
 
-      <MarketTicker
-        stocks={stocks}
-        stockData={stockData}
-        marketQuotes={marketQuotes}
-        marketIndices={marketIndices}
-        selectedStock={selectedStock}
-        onStockChange={onStockChange}
-        session={session}
-      />
+      
+<MarketTicker
+  stocks={stocks}
+  stockData={stockData}
+  marketQuotes={
+    session?.dataSource === "angel"
+      ? marketQuotes
+      : nseHeaderQuotes
+  }
+  marketIndices={
+    session?.dataSource === "angel"
+      ? marketIndices
+      : nseHeaderIndices
+  }
+  selectedStock={selectedStock}
+  onStockChange={onStockChange}
+  session={session}
+/>
+
 
 
     </header>
