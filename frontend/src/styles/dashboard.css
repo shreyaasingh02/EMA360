@@ -5114,6 +5114,13 @@ footer {
   align-items: stretch;
   height: 100%;
 }
+/* EMA360 — FORCE SLOWER TICKER */
+.ema360-market-ticker .ema360-ticker-track {
+    animation-name: ema360-ticker-scroll !important;
+    animation-duration: 240s !important;
+    animation-timing-function: linear !important;
+    animation-iteration-count: infinite !important;
+}
 .ema360-ticker-item {
   display: flex;
   flex: 0 0 198px;
