@@ -5174,3 +5174,26 @@ footer {
   .ema360-market-ticker { height: 51px; }
   .ema360-ticker-item { flex-basis: 150px; min-width: 150px; padding: 5px 10px; }
 }
+
+.ema360-ticker-value.up {
+  color: #22c55e;
+}
+
+.ema360-ticker-value.down {
+  color: #ef4444;
+}
+
+.ema360-ticker-value.flat {
+  color: #9ca3af;
+}
+
+.ema360-ticker-value small {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ema360-ticker-empty {
+  padding: 10px 16px;
+  color: #9ca3af;
+}

@@ -537,6 +537,7 @@ function Header({
 <MarketTicker
   stocks={stocks}
   stockData={stockData}
+  dataVersion={dataVersion}
   marketQuotes={
     session?.dataSource === "angel"
       ? marketQuotes
