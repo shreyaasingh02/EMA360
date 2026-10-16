@@ -1,281 +1,155 @@
+import React, { memo, useMemo } from "react";
+// import "./MarketTicker.css";
 
-import React, { useMemo } from "react";
+const DEFAULT_SYMBOLS = [
+  "NIFTY 50", "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY",
+  "BHARTIARTL", "SBIN", "TCS", "ITC", "LT",
+  "AXISBANK", "KOTAKBANK", "TATAMOTORS", "BAJFINANCE", "TRENT",
+  "SUNPHARMA", "NTPC", "BEL", "M&M", "MARUTI"
+];
 
-function entries(value) {
-  if (Array.isArray(value)) return value;
-
-  if (!value || typeof value !== "object") return [];
-
-  return Object.entries(value).map(([symbol, item]) =>
-    item && typeof item === "object"
-      ? { ...item, symbol: item.symbol || symbol }
-      : { symbol, price: item }
-  );
-}
-
-function number(...values) {
+const toNumber = (...values) => {
   for (const value of values) {
-    if (value === undefined || value === null || value === "") continue;
-
-    const parsed = Number(String(value).replace(/,/g, "").replace(/%/g, ""));
-
-    if (Number.isFinite(parsed)) return parsed;
+    if (value === null || value === undefined || value === "") continue;
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
   }
-
   return null;
-}
+};
 
-function getSymbol(item) {
-  return String(
-    item?.symbol || item?.name || item?.tradingSymbol || item?.stock || ""
-  )
-    .trim()
-    .toUpperCase()
-    .replace(/[-_](EQ|BE|BZ|SM)$/i, "");
-}
+const normalizeSymbol = value =>
+  String(value ?? "").trim().toUpperCase().replace(/\s+/g, "");
 
-function getPrice(item) {
-  if (!item) return null;
+const formatPrice = value =>
+  value == null ? "--" : Number(value).toLocaleString("en-IN", {
+    minimumFractionDigits: 2, maximumFractionDigits: 2
+  });
 
-  const direct = number(
-    item.price,
-    item.ltp,
-    item.lastPrice,
-    item.indexValue,
-    item.currentValue,
-    item.close,
-    item.c,
-    item.last
-  );
+const formatPercent = value =>
+  value == null ? "--" :
+    `${value > 0 ? "+" : value < 0 ? "−" : ""}${Math.abs(value).toFixed(2)}%`;
 
-  if (direct !== null && direct > 0) return direct;
-
-  // Angel One stockData stores candles by timeframe.
-  const histories = [
-    item["1M"],
-    item["3M"],
-    item["5M"],
-    item["15M"],
-    item["30M"],
-    item["1H"],
-    item["1D"],
-    item.candles,
-    item.data,
-    item.history,
-  ];
-
-  let newest = null;
-
-  for (const history of histories) {
-    if (!Array.isArray(history) || !history.length) continue;
-
-    const last = history[history.length - 1];
-    if (!last) continue;
-
-    const time = new Date(last.time).getTime();
-    const newestTime = newest
-      ? new Date(newest.time).getTime()
-      : -Infinity;
-
-    if (!newest || (Number.isFinite(time) && time > newestTime)) {
-      newest = last;
-    }
-  }
-
-  return number(newest?.c, newest?.close, newest?.ltp, newest?.price, newest?.[4]);
-}
-
-function getChange(item, price, previousCandle = null) {
-  const supplied = number(
-    item?.change,
-    item?.changePercent,
-    item?.pChange,
-    item?.percentChange,
-    item?.percentageChange,
-    item?.changePct
-  );
-
-  if (supplied !== null) return supplied;
-
-  const previousClose = number(
-    item?.previousClose,
-    item?.prevClose,
-    item?.previous_close
-  );
-
-  if (price !== null && previousClose > 0) {
-    return ((price - previousClose) / previousClose) * 100;
-  }
-
-  // For Angel One, use the preceding daily candle when available.
-  if (price !== null && previousCandle > 0) {
-    return ((price - previousCandle) / previousCandle) * 100;
-  }
-
-  return null;
-}
-
-function getAngelRows(stockData) {
-  return entries(stockData).map((item) => {
-    const symbol = getSymbol(item);
-    const histories = Object.values(item || {}).filter(
-      (value) => Array.isArray(value) && value.length
-    );
-
+function candleRows(stockData = {}) {
+  return Object.entries(stockData || {}).map(([symbol, timeframes]) => {
+    if (!timeframes || typeof timeframes !== "object") return null;
     let newest = null;
+    let previousDailyClose = null;
 
-    for (const history of histories) {
-      const last = history[history.length - 1];
+    for (const [timeframe, candles] of Object.entries(timeframes)) {
+      if (!Array.isArray(candles) || !candles.length) continue;
+      const last = candles[candles.length - 1];
+      if (!last) continue;
+      const lastTime = new Date(last.time ?? last.t ?? 0).getTime();
+      const newestTime = newest
+        ? new Date(newest.time ?? newest.t ?? 0).getTime()
+        : -Infinity;
+      if (!newest || (Number.isFinite(lastTime) && lastTime >= newestTime)) newest = last;
 
-      if (
-        last &&
-        (!newest ||
-          new Date(last.time).getTime() >
-            new Date(newest.time).getTime())
-      ) {
-        newest = last;
+      if (["1D", "D", "ONE_DAY", "DAY"].includes(String(timeframe).toUpperCase()) && candles.length > 1) {
+        const previous = candles[candles.length - 2];
+        previousDailyClose = toNumber(previous?.c, previous?.close);
       }
     }
 
-    const price = getPrice(item);
-
-    // Use the previous daily candle for the day-change calculation.
-    const daily = Array.isArray(item["1D"]) ? item["1D"] : [];
-    const previousDailyClose =
-      daily.length >= 2
-        ? number(daily[daily.length - 2]?.c, daily[daily.length - 2]?.close)
-        : null;
-
-    const change = getChange(item, price, previousDailyClose);
-
-    return { symbol, price, change, source: "ANGEL" };
-  });
+    if (!newest) return null;
+    const price = toNumber(newest.c, newest.close, newest.ltp, newest.price);
+    const change = previousDailyClose != null && price != null ? price - previousDailyClose : null;
+    const percent = previousDailyClose > 0 && change != null ? change / previousDailyClose * 100 : null;
+    return { symbol, price, change, percent, volume: toNumber(newest.v, newest.volume) ?? 0 };
+  }).filter(Boolean);
 }
 
-function formatPrice(price) {
-  return price === null
-    ? "—"
-    : price.toLocaleString("en-IN", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      });
+function quoteRows(source = {}) {
+  return Object.entries(source || {}).map(([key, quote]) => {
+    if (!quote || typeof quote !== "object") return null;
+    const symbol = quote.symbol || quote.name || key;
+    const price = toNumber(quote.price, quote.ltp, quote.lastPrice, quote.last_traded_price);
+    const previousClose = toNumber(quote.previousClose, quote.prevClose, quote.previous_close, quote.close);
+    let percent = toNumber(quote.percent, quote.percentChange, quote.pChange);
+    const rawChange = toNumber(quote.change);
+
+    if (percent == null && rawChange != null) {
+      percent = quote.changeIsPercent === false
+        ? (previousClose > 0 ? rawChange / previousClose * 100 : null)
+        : rawChange;
+    }
+    let change = price != null && previousClose > 0
+      ? price - previousClose
+      : (rawChange != null && quote.changeIsPercent === false ? rawChange : null);
+
+    return {
+      symbol: String(symbol), price, change, percent,
+      volume: toNumber(quote.volume, quote.totalTradedVolume) ?? 0
+    };
+  }).filter(Boolean);
 }
 
-function formatChange(change) {
-  if (change === null) return "—";
-
-  const sign = change > 0 ? "+" : change < 0 ? "−" : "";
-
-  return `${sign}${Math.abs(change).toFixed(2)}%`;
-}
-
-export default function MarketTicker({
-  stockData = {},
-  dataVersion,
-  marketQuotes = {},
-  selectedStock,
-  onStockChange,
-  session,
+function MarketTicker({
+  stocks = [], stockData = {}, marketQuotes = {}, marketIndices = {},
+  selectedStock, onStockChange, session = null, dataVersion = 0
 }) {
-  const isAngel =
-    String(
-      session?.dataSource ||
-        (session?.brokerConnected ? "angel" : "nse")
-    ).toLowerCase() === "angel";
+  const isAngel = session?.dataSource === "angel";
 
-  const items = useMemo(() => {
-    let rows = [];
+  const rows = useMemo(() => {
+    // Strict source separation: no NSE fallback in Angel One mode.
+    const rawRows = isAngel
+      ? [...quoteRows(marketQuotes), ...candleRows(stockData)]
+      : [...quoteRows(marketIndices), ...quoteRows(marketQuotes)];
 
-    if (isAngel) {
-      // Never mix NSE quotes into Angel One mode.
-      rows = getAngelRows(stockData);
-    } else {
-      // The NSE endpoint currently supplies NIFTY 50 constituents.
-      rows = entries(marketQuotes).map((item) => {
-        const price = number(
-          item.price,
-          item.ltp,
-          item.lastPrice,
-          item.last,
-          item.close
-        );
-
-        return {
-          symbol: getSymbol(item),
-          price: price !== null && price > 0 ? price : null,
-          change: getChange(item, price),
-          volume: number(item.volume, item.totalTradedVolume),
-          source: "NSE",
-        };
-      });
+    const bySymbol = new Map();
+    for (const row of rawRows) {
+      const key = normalizeSymbol(row.symbol);
+      if (!key) continue;
+      const existing = bySymbol.get(key);
+      if (!existing || (existing.price == null && row.price != null)) {
+        bySymbol.set(key, row);
+      } else if (existing.percent == null && row.percent != null) {
+        bySymbol.set(key, { ...existing, ...row });
+      }
     }
 
-    // Exclude invalid quotes and stocks without a usable change value.
-    // Rank the strongest movers first; use volume to break ties.
-    return rows
-      .filter(
-        (item) =>
-          item.symbol &&
-          item.price !== null &&
-          item.price > 0 &&
-          item.change !== null
-      )
-      .sort(
-        (a, b) =>
-          Math.abs(b.change) - Math.abs(a.change) ||
-          (b.volume || 0) - (a.volume || 0)
-      )
-      .slice(0, 20);
-  }, [isAngel, stockData, dataVersion, marketQuotes]);
-
-  const renderItems = (copy) =>
-    items.map((item) => {
-      const tone =
-        item.change > 0 ? "up" : item.change < 0 ? "down" : "flat";
-
-      return (
-        <button
-          className="ema360-ticker-item"
-          key={`${copy}-${item.symbol}`}
-          type="button"
-          onClick={() => onStockChange?.(item.symbol)}
-          title={`Select ${item.symbol}`}
-          tabIndex={copy ? -1 : 0}
-        >
-          <span className="ema360-ticker-symbol">{item.symbol}</span>
-
-          <span className={`ema360-ticker-value ${tone}`}>
-            {formatPrice(item.price)}
-            <small>{formatChange(item.change)}</small>
-          </span>
-        </button>
-      );
-    });
-
-  if (!items.length) {
-    return (
-      <div
-        className="ema360-market-ticker"
-        aria-label="Market ticker"
-      >
-        <div className="ema360-ticker-empty">
-          Waiting for {isAngel ? "Angel One" : "NSE"} market data…
-        </div>
-      </div>
+    const available = [...bySymbol.values()].filter(row => row.price != null);
+    available.sort((a, b) =>
+      Math.abs(b.percent ?? 0) - Math.abs(a.percent ?? 0) ||
+      (b.volume ?? 0) - (a.volume ?? 0)
     );
-  }
+
+    const placeholders = (stocks.length ? stocks : DEFAULT_SYMBOLS)
+      .filter(symbol => !bySymbol.has(normalizeSymbol(symbol)))
+      .map(symbol => ({
+        symbol: String(symbol), price: null, change: null, percent: null,
+        volume: 0, isPlaceholder: true
+      }));
+
+    return [...available, ...placeholders].slice(0, 20);
+  }, [isAngel, stocks, stockData, marketQuotes, marketIndices, dataVersion]);
 
   return (
-    <div
-      className="ema360-market-ticker"
-      aria-label={`${isAngel ? "Angel One" : "NSE"} trending stocks`}
-    >
+    <div className="ema360-ticker" aria-label="Market ticker">
       <div className="ema360-ticker-track">
-        <div className="ema360-ticker-group">{renderItems(0)}</div>
-        <div className="ema360-ticker-group" aria-hidden="true">
-          {renderItems(1)}
-        </div>
+        {rows.map((row, index) => {
+          const tone = row.percent > 0 ? "up" : row.percent < 0 ? "down" : "flat";
+          return (
+            <button
+              type="button"
+              className="ema360-ticker-item"
+              key={`${normalizeSymbol(row.symbol)}-${index}`}
+              onClick={() => onStockChange?.(row.symbol)}
+              title={`Select ${row.symbol}`}
+            >
+              <span className="ema360-ticker-symbol">
+                {row.symbol}
+                {selectedStock && normalizeSymbol(selectedStock) === normalizeSymbol(row.symbol)
+                  ? <span className="ema360-ticker-selected"> •</span> : null}
+              </span>
+              <span className="ema360-ticker-price">{formatPrice(row.price)}</span>
+              <span className={`ema360-ticker-change ${tone}`}>{formatPercent(row.percent)}</span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
 }
+
+export default memo(MarketTicker);

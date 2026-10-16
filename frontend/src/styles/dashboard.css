@@ -5197,3 +5197,31 @@ footer {
   padding: 10px 16px;
   color: #9ca3af;
 }
+
+.ema360-ticker {
+  width: 100%; min-height: 48px; overflow: hidden;
+  background: #06202b; border-top: 1px solid rgba(67,190,210,.25);
+  border-bottom: 1px solid rgba(67,190,210,.25); color: #e8f1f5;
+}
+.ema360-ticker-track {
+  display: flex; align-items: stretch; width: max-content; min-height: 48px;
+  animation: ema360-ticker-scroll 55s linear infinite;
+}
+.ema360-ticker:hover .ema360-ticker-track { animation-play-state: paused; }
+.ema360-ticker-item {
+  display: flex; flex: 0 0 auto; align-items: center; gap: 10px; min-height: 48px;
+  padding: 0 18px; border: 0; border-right: 1px solid rgba(148,163,184,.18);
+  background: transparent; color: inherit; font: inherit; cursor: pointer; white-space: nowrap;
+}
+.ema360-ticker-item:hover { background: rgba(255,255,255,.06); }
+.ema360-ticker-symbol { color: #e8f1f5; font-size: 12px; font-weight: 700; }
+.ema360-ticker-selected { color: #22c55e; }
+.ema360-ticker-price { color: #d5e2e8; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ema360-ticker-change { font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.ema360-ticker-change.up { color: #22c55e; }
+.ema360-ticker-change.down { color: #ef4444; }
+.ema360-ticker-change.flat { color: #9ca3af; }
+@keyframes ema360-ticker-scroll { from { transform: translateX(0); } to { transform: translateX(-35%); } }
+@media (prefers-reduced-motion: reduce) {
+  .ema360-ticker-track { animation: none; flex-wrap: wrap; width: 100%; }
+}
