@@ -2937,148 +2937,40 @@ function keepOnlyCompletedCandles(candles, timeframe) {
 // FETCH NSE CANDLES FOR SELECTED TIMEFRAME
 // ------------------------------------------------------------
 async function getNseCandles(symbol, timeframe = "5m", includeIncomplete = false) {
+    const requested = String(symbol || "").trim().toUpperCase();
+    const tf = String(timeframe || "5m").trim().toLowerCase();
+    if (!requested) return [];
+
+    // IMPORTANT: Do not call stock-nse-india / www.nseindia.com from Render.
+    // Render's outbound IP is currently receiving HTTP 403. Use NSE's MCP
+    // live quote snapshots instead, which are also used by the market cards.
+    const nseSymbol = requested === "TATAMOTORS" ? "TMPV" : requested;
     try {
-        const token = await getNseToken(symbol);
-
-        console.log(
-            "DIAGNOSTIC TOKEN:",
-            symbol,
-            "=>",
-            token
-        );
-
-        if (!token) {
-            console.log(
-                "❌ NO NSE TOKEN FOR:",
-                symbol
-            );
-
-            return [];
+        let candles;
+        if (["1m", "3m", "5m", "15m", "30m", "1h"].includes(tf)) {
+            candles = requested === "NIFTY 50"
+                ? await nseMcpClient.getIndexIntradayCandles("NIFTY 50", tf)
+                : await nseMcpClient.getIntradayCandles(nseSymbol, tf);
+        } else if (["1d", "1D", "D"].includes(tf)) {
+            const end = new Date();
+            const start = new Date(end.getTime() - 1000 * 24 * 60 * 60 * 1000);
+            const response = requested === "NIFTY 50"
+                ? await nseMcpClient.getIndexHistoricalData("NIFTY 50", { start, end })
+                : await nseMcpClient.getEquityHistoricalData(nseSymbol, { start, end });
+            candles = normalizeNseCandles(response);
+        } else {
+            throw new Error(`Unsupported NSE timeframe: ${timeframe}`);
         }
 
-        /*
-         * Large warm-up windows are intentional. Chartink calculates
-         * indicators from a historical intraday series; using only the
-         * latest 10 days can make EMA20 differ at the latest candle.
-         */
-        const timeframeConfig = {
-            "1m": {
-                interval: 1,
-                days: 15
-            },
-
-            "3m": {
-                interval: 3,
-                days: 30
-            },
-
-            "5m": {
-                interval: 5,
-                days: 60
-            },
-
-            "15m": {
-                interval: 15,
-                days: 120
-            },
-
-            "30m": {
-                interval: 30,
-                days: 180
-            },
-
-            "1h": {
-                interval: 60,
-                days: 365
-            },
-
-            "1d": {
-                interval: "D",
-                days: 1000
-            }
-        };
-
-        const config = timeframeConfig[timeframe];
-
-        if (!config) {
-            throw new Error(
-                `Unsupported NSE timeframe: ${timeframe}`
-            );
-        }
-
-        const now = new Date();
-
-        const start = new Date(
-            now.getTime() -
-            config.days * 24 * 60 * 60 * 1000
-        );
-
-        const response =
-            await nseIndia.getEquityChartHistoricalData(
-                symbol,
-                {
-                    start,
-                    end: now,
-                },
-                token,
-                "Equity",
-                "I",
-                config.interval
-            );
-
+        const normalized = normalizeMarketCandleShape(candles || []);
         console.log(
-            "NSE RAW RESPONSE:",
-            symbol,
-            "type =",
-            Array.isArray(response)
-                ? "ARRAY"
-                : typeof response,
-            "length =",
-            Array.isArray(response)
-                ? response.length
-                : Array.isArray(response?.data)
-                    ? response.data.length
-                    : "NO DATA ARRAY"
+            "🇮🇳 NSE MCP candles:", requested, tf,
+            "count =", normalized.length,
+            "latest =", normalized.at(-1)?.time || "none"
         );
-
-        const candles = normalizeNseCandles(response);
-
-        console.log(
-            "NSE NORMALIZED:",
-            symbol,
-            "candles =",
-            candles.length
-        );
-
-        if (candles.length > 0) {
-            console.log(
-                "NSE FIRST CANDLE:",
-                candles[0]
-            );
-
-            console.log(
-                "NSE LAST CANDLE:",
-                candles[candles.length - 1]
-            );
-        }
-
-        // Normal scanner behavior:
-        // only completed candles are returned.
-        //
-        // Diagnostic mode:
-        // return the raw NSE series, including the latest
-        // possibly-incomplete candle.
-        return includeIncomplete
-            ? candles
-            : keepOnlyCompletedCandles(candles, timeframe);
-
+        return includeIncomplete ? normalized : keepOnlyCompletedCandles(normalized, tf);
     } catch (error) {
-
-        console.log(
-            `NSE ${timeframe} candle fetch failed for ${symbol}:`,
-            error.message
-        );
-
+        console.error(`NSE MCP candle fetch failed for ${requested} ${tf}:`, error?.message || error);
         return [];
     }
 }
@@ -4472,45 +4364,15 @@ function normalizeNseIndexChartPayload(payload) {
 }
 
 async function getNseIndexHistoricalCandles(timeframe = "5m") {
-    const config = {
-        "1m": { interval: "1", days: 5 },
-        "3m": { interval: "3", days: 15 },
-        "5m": { interval: "5", days: 30 },
-        "15m": { interval: "15", days: 90 },
-        "30m": { interval: "30", days: 120 },
-        "1h": { interval: "60", days: 365 }
-    }[String(timeframe || "5m").toLowerCase()];
-
-    if (!config) return [];
-
-    const end = new Date();
-    const start = new Date(end.getTime() - config.days * 24 * 60 * 60 * 1000);
-
-    // Use NSE's charting OHLC API for real historical index candles. This
-    // avoids depending on an in-memory snapshot store that is empty after a
-    // Render restart. If token lookup fails, the library is allowed to try
-    // its own symbol resolution before we fall back to MCP snapshots.
-    let token;
     try {
-        const info = await nseIndia.getEquitySymbolInfo("NIFTY 50", "Index");
-        token = info?.scripCode ?? info?.scripcode ?? info?.scripcodeValue ?? info?.token;
+        const candles = await nseMcpClient.getIndexIntradayCandles("NIFTY 50", timeframe);
+        const normalized = normalizeMarketCandleShape(candles || []);
+        console.log("🇮🇳 NSE MCP INDEX CANDLES: NIFTY 50", timeframe, "candles =", normalized.length);
+        return normalized;
     } catch (error) {
-        console.warn("⚠️ NSE charting index token lookup failed; trying automatic resolution:", error?.message || error);
+        console.error("NSE MCP index candle fetch failed:", error?.message || error);
+        return [];
     }
-
-    const response = await nseIndia.getEquityChartHistoricalData(
-        "NIFTY 50",
-        { start, end },
-        token,
-        "Index",
-        "I",
-        config.interval
-    );
-
-    const rows = normalizeNseIndexChartPayload(response);
-    const candles = normalizeMarketCandleShape(rows);
-    console.log("🇮🇳 NSE CHARTING INDEX CANDLES: NIFTY 50", timeframe, "candles =", candles.length);
-    return candles;
 }
 
 async function getNseMarketCandles(symbol, timeframe = "5m") {
