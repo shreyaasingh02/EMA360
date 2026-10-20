@@ -6253,6 +6253,8 @@ function normalizeNseTopMover(row = {}) {
         ),
 
         previousClose: pick(
+            row.prev_price,
+            row.prevPrice,
             row.previousPrice,
             row.previousClose,
             row.prevClose,
@@ -6284,8 +6286,11 @@ function normalizeNseTopMover(row = {}) {
 
         volume: pick(
             row.traded_quantity,
+            row.tradedQuantity,
             row.quantityTraded,
             row.totalTradedQty,
+            row.totalTradedVolume,
+            row.tradedVolume,
             row.volume,
             row.VOLUME
         ),
