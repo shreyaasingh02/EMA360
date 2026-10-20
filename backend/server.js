@@ -6196,69 +6196,116 @@ function nseTopMoverRows(payload) {
 }
 
 
+
 function normalizeNseTopMover(row = {}) {
-  const num = (...values) => {
-    for (const value of values) {
-      if (value === null || value === undefined || value === "") continue;
+    const pick = (...values) => {
+        for (const value of values) {
+            if (value === null || value === undefined || value === "") {
+                continue;
+            }
 
-      const n = Number(
-        String(value).replace(/,/g, "").replace(/%/g, "").trim()
-      );
+            if (typeof value === "number") {
+                if (Number.isFinite(value)) return value;
+                continue;
+            }
 
-      if (Number.isFinite(n)) return n;
-    }
-    return null;
-  };
+            const cleaned = String(value)
+                .replace(/,/g, "")
+                .replace(/%/g, "")
+                .trim();
 
-  return {
-    symbol: String(row.symbol ?? row.SYMBOL ?? row.symbolName ?? "").trim(),
+            if (!cleaned || cleaned === "-") continue;
 
-    open: num(row.open, row.OPEN, row.openPrice),
-    high: num(row.high, row.HIGH, row.dayHigh, row.highPrice),
-    low: num(row.low, row.LOW, row.dayLow, row.lowPrice),
+            const number = Number(cleaned);
+            if (Number.isFinite(number)) return number;
+        }
 
-    previousClose: num(
-      row.previousClose,
-      row.prevClose,
-      row.prev_close,
-      row.PREV_CLOSE,
-      row.previousPrice
-    ),
+        return null;
+    };
 
-    ltp: num(row.ltp, row.LTP, row.lastPrice, row.last_price),
+    return {
+        symbol: String(
+            row.symbol ??
+            row.SYMBOL ??
+            row.symbolName ??
+            ""
+        ).trim(),
 
-    change: num(
-      row.net_price,
-      row.netPrice,
-      row.change,
-      row.CHANGE
-    ),
+        open: pick(
+            row.open_price,
+            row.openPrice,
+            row.open,
+            row.OPEN
+        ),
 
-    pChange: num(
-      row.perChange,
-      row.pChange,
-      row.pchange,
-      row.percentChange,
-      row["%CHNG"]
-    ),
+        high: pick(
+            row.high_price,
+            row.highPrice,
+            row.high,
+            row.HIGH
+        ),
 
-    volume: num(
-      row.traded_quantity,
-      row.quantityTraded,
-      row.volume,
-      row.VOLUME
-    ),
+        low: pick(
+            row.low_price,
+            row.lowPrice,
+            row.low,
+            row.LOW
+        ),
 
-    value: num(
-      row.value,
-      row.VALUE,
-      row.turnover,
-      row.totalTradedValue
-    ),
+        previousClose: pick(
+            row.previousPrice,
+            row.previousClose,
+            row.prevClose,
+            row.prev_close,
+            row.PREV_CLOSE
+        ),
 
-    ca: row.ca ?? row.CA ?? row.corporateAction ?? null
-  };
+        ltp: pick(
+            row.ltp,
+            row.LTP,
+            row.lastPrice,
+            row.last_price
+        ),
+
+        change: pick(
+            row.net_price,
+            row.netPrice,
+            row.change,
+            row.CHANGE
+        ),
+
+        pChange: pick(
+            row.perChange,
+            row.pChange,
+            row.pchange,
+            row.percentChange,
+            row["%CHNG"]
+        ),
+
+        volume: pick(
+            row.traded_quantity,
+            row.quantityTraded,
+            row.totalTradedQty,
+            row.volume,
+            row.VOLUME
+        ),
+
+        value: pick(
+            row.turnover,
+            row.turnover_lakhs,
+            row.value,
+            row.VALUE,
+            row.totalTradedValue
+        ),
+
+        ca:
+            row.ca ??
+            row.CA ??
+            row.corporateAction ??
+            null
+    };
 }
+
 
 
 async function fetchNseTopMovers() {
@@ -6293,17 +6340,23 @@ async function fetchNseTopMovers() {
                 })
             ]);
 
-            const gainers = nseTopMoverRows(gainersResponse.data)
+
+            const gainers = nseTopMoverRows(gainersResponse?.data)
                 .map(normalizeNseTopMover)
-                .filter(row => row.symbol && row.pChange !== null)
-                .sort((a, b) => b.pChange - a.pChange)
+                .filter(row => row.symbol)
+                .sort((a, b) =>
+                    (b.pChange ?? -Infinity) - (a.pChange ?? -Infinity)
+                )
                 .slice(0, 20);
 
-            const losers = nseTopMoverRows(losersResponse.data)
+            const losers = nseTopMoverRows(losersResponse?.data)
                 .map(normalizeNseTopMover)
-                .filter(row => row.symbol && row.pChange !== null)
-                .sort((a, b) => a.pChange - b.pChange)
+                .filter(row => row.symbol)
+                .sort((a, b) =>
+                    (a.pChange ?? Infinity) - (b.pChange ?? Infinity)
+                )
                 .slice(0, 20);
+
 
             const result = {
                 success: true,
