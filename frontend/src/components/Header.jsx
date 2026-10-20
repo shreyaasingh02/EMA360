@@ -441,7 +441,7 @@ function Header({
                 }
 
                 if (item === "Top Movers") {
-                  setShowTopMovers(prev => !prev);
+                  onNavigate?.("topMovers");
                   return;
                 }
 
@@ -533,12 +533,6 @@ function Header({
         >
           {session ? "Login / Sign up" : "Logout"}
         </button>
-
-        {showTopMovers && (
-          <div className="ema360-top-movers-panel">
-            <NseTopMovers />
-          </div>
-        )}
 
       </div>
 

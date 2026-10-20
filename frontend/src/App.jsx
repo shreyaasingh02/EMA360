@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import Header from "./components/Header";
 import Scanner from "./components/Scanner";
 import LongDeals from "./components/LongDeals";
+import NseTopMovers from "./components/NseTopMovers";
 
 
 import LayersPanel from "./components/LayersPanel";
@@ -821,14 +822,35 @@ function MarketApp({ session, onLogout }) {
         );
     }
 
+    
+if (activePage === "topMovers") {
     return (
-
-
-
         <>
+            <Header
+                selectedStock={selectedStock}
+                activePage={activePage}
+                onNavigate={handleNavigate}
+                currentTF={currentTF}
+                stocks={stocks}
+                stockData={stockData}
+                dataVersion={dataVersion}
+                marketQuotes={marketQuotes}
+                marketIndices={marketIndices}
+                onStockChange={handleStockChange}
+                onTimeframeChange={handleTimeframeChange}
+                onToggleLayers={handleToggleLayers}
+                session={session}
+                onLogout={onLogout}
+            />
+
+            <NseTopMovers />
+        </>
+    );
+}
 
 
-
+    return (
+        <>
             <Header
                 selectedStock={selectedStock}
                 activePage={activePage}
