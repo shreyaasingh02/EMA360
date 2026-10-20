@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
 import MarketTicker from "./MarketTicker";
+import NseTopMovers from "./NseTopMovers";
 
 function Header({
   selectedStock,
@@ -554,6 +555,7 @@ function Header({
   session={session}
 />
 
+<NseTopMovers />
 
 
     </header>

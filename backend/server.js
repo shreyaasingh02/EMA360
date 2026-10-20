@@ -793,7 +793,7 @@ async function startAngelWebSocket(sessionId, session) {
     /* Close an older socket for the same EMA360 session, if any. */
     const existing = angelWebSockets.get(sessionId);
     if (existing) {
-        try { existing.close(); } catch (_) {}
+        try { existing.close(); } catch (_) { }
         angelWebSockets.delete(sessionId);
     }
 
@@ -860,7 +860,7 @@ async function startAngelWebSocket(sessionId, session) {
                 if (clientSessionId !== sessionId) continue;
                 try {
                     clientRes.write(`data: ${JSON.stringify(normalizedTick)}\n\n`);
-                } catch (_) {}
+                } catch (_) { }
             }
         });
 
@@ -883,7 +883,7 @@ async function startAngelWebSocket(sessionId, session) {
 function stopAngelWebSocket(sessionId) {
     const ws = angelWebSockets.get(sessionId);
     if (ws) {
-        try { ws.close(); } catch (_) {}
+        try { ws.close(); } catch (_) { }
         angelWebSockets.delete(sessionId);
     }
     latestTicksBySession.delete(sessionId);
@@ -2226,7 +2226,7 @@ async function getNsePriorityStocks() {
 
                             const latest =
                                 daily[
-                                    daily.length - 1
+                                daily.length - 1
                                 ];
 
 
@@ -3233,7 +3233,7 @@ async function getNseResultStatsFromCandles(symbol, candles) {
             console.log(
                 `NSE DAILY LAST ROW ${symbol}:`,
                 dailyRaw[
-                    dailyRaw.length - 1
+                dailyRaw.length - 1
                 ]
             );
 
@@ -3339,7 +3339,7 @@ async function getNseResultStatsFromCandles(symbol, candles) {
 
             const latestDaily =
                 daily[
-                    daily.length - 1
+                daily.length - 1
                 ];
 
 
@@ -3513,7 +3513,7 @@ async function getNseResultStatsFromCandles(symbol, candles) {
 
     const latest =
         ordered[
-            ordered.length - 1
+        ordered.length - 1
         ];
 
 
@@ -3573,12 +3573,12 @@ async function getNseResultStatsFromCandles(symbol, candles) {
                     )
             )
         ]
-        .sort();
+            .sort();
 
 
     const previousDay =
         previousDays[
-            previousDays.length - 1
+        previousDays.length - 1
         ];
 
 
@@ -4046,22 +4046,22 @@ app.get("/api/scanner/nse/check-adsl", async (req, res) => {
         const timeframe = "5m";
 
         const candles = await getNseCandles(
-    symbol,
-    timeframe
-);
+            symbol,
+            timeframe
+        );
 
-if (!candles || candles.length === 0) {
-    return res.json({
-        success: false,
-        message: "No candles"
-    });
-}
+        if (!candles || candles.length === 0) {
+            return res.json({
+                success: false,
+                message: "No candles"
+            });
+        }
 
-const stats =
-    await getNseResultStatsFromCandles(
-        symbol,
-        candles
-    );
+        const stats =
+            await getNseResultStatsFromCandles(
+                symbol,
+                candles
+            );
 
         return res.json({
             success: true,
@@ -4235,12 +4235,12 @@ function normalizeNseIndexHistorical(raw) {
 function normalizeNseIndexIntradayCandles(graph, timeframe = "5m") {
     const intervalMinutes =
         timeframe === "1m" ? 1 :
-        timeframe === "3m" ? 3 :
-        timeframe === "5m" ? 5 :
-        timeframe === "15m" ? 15 :
-        timeframe === "30m" ? 30 :
-        timeframe === "1h" ? 60 :
-        null;
+            timeframe === "3m" ? 3 :
+                timeframe === "5m" ? 5 :
+                    timeframe === "15m" ? 15 :
+                        timeframe === "30m" ? 30 :
+                            timeframe === "1h" ? 60 :
+                                null;
 
     if (!intervalMinutes || !Array.isArray(graph)) {
         return [];
@@ -5285,10 +5285,10 @@ app.get("/api/scanner/nse/candles", async (req, res) => {
          * snapshot. No second NSE quote request is made here.
          */
         const stats =
-    await getNseResultStatsFromCandles(
-        symbol,
-        candles
-    );
+            await getNseResultStatsFromCandles(
+                symbol,
+                candles
+            );
 
         if (!stats) {
             return res.json({
@@ -5925,7 +5925,7 @@ async function fetchNseLargeDeals() {
     if (
         NSE_LARGE_DEALS_CACHE.data &&
         now - NSE_LARGE_DEALS_CACHE.timestamp <
-            NSE_LARGE_DEALS_CACHE_MS
+        NSE_LARGE_DEALS_CACHE_MS
     ) {
 
         return NSE_LARGE_DEALS_CACHE.data;
@@ -6154,6 +6154,195 @@ app.get(
 
     }
 );
+
+
+const NSE_TOP_MOVERS_CACHE_MS = 60 * 1000;
+let nseTopMoversCache = { timestamp: 0, data: null };
+let nseTopMoversInFlight = null;
+
+function nseTopMoversHeaders() {
+    return {
+        "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/market-data/top-gainers-losers",
+        "Origin": "https://www.nseindia.com"
+    };
+}
+
+function nseTopMoverRows(payload) {
+    const candidates = [
+        payload?.NIFTY?.data,
+        payload?.NIFTY,
+        payload?.data,
+        payload?.data?.NIFTY,
+        payload?.NIFTY50?.data,
+        payload?.NIFTY_50?.data
+    ];
+
+    for (const value of candidates) {
+        if (Array.isArray(value)) return value;
+    }
+
+    if (payload && typeof payload === "object") {
+        for (const value of Object.values(payload)) {
+            if (Array.isArray(value)) return value;
+            if (value && Array.isArray(value.data)) return value.data;
+        }
+    }
+
+    return [];
+}
+
+function normalizeNseTopMover(row = {}) {
+    const num = (...values) => {
+        for (const value of values) {
+            if (value === null || value === undefined || value === "") continue;
+
+            const n = Number(
+                String(value).replace(/,/g, "").replace(/%/g, "").trim()
+            );
+
+            if (Number.isFinite(n)) return n;
+        }
+
+        return null;
+    };
+
+    return {
+        symbol: String(
+            row.symbol ?? row.SYMBOL ?? row.symbolName ?? ""
+        ).trim(),
+
+        ltp: num(row.ltp, row.LTP, row.lastPrice, row.last_price),
+
+        change: num(
+            row.net_price,
+            row.netPrice,
+            row.change,
+            row.CHANGE
+        ),
+
+        pChange: num(
+            row.perChange,
+            row.pChange,
+            row.pchange,
+            row.percentChange,
+            row["%CHNG"]
+        ),
+
+        volume: num(
+            row.traded_quantity,
+            row.quantityTraded,
+            row.volume,
+            row.VOLUME
+        )
+    };
+}
+
+async function fetchNseTopMovers() {
+    const now = Date.now();
+
+    if (
+        nseTopMoversCache.data &&
+        now - nseTopMoversCache.timestamp < NSE_TOP_MOVERS_CACHE_MS
+    ) {
+        return nseTopMoversCache.data;
+    }
+
+    if (nseTopMoversInFlight) {
+        return nseTopMoversInFlight;
+    }
+
+    nseTopMoversInFlight = (async () => {
+        try {
+            const base =
+                "https://www.nseindia.com/api/live-analysis-variations";
+
+            const [gainersResponse, losersResponse] = await Promise.all([
+                axios.get(`${base}?index=gainers`, {
+                    headers: nseTopMoversHeaders(),
+                    timeout: 15000
+                }),
+
+                // NSE uses this spelling: "loosers".
+                axios.get(`${base}?index=loosers`, {
+                    headers: nseTopMoversHeaders(),
+                    timeout: 15000
+                })
+            ]);
+
+            const gainers = nseTopMoverRows(gainersResponse.data)
+                .map(normalizeNseTopMover)
+                .filter(row => row.symbol && row.pChange !== null)
+                .sort((a, b) => b.pChange - a.pChange)
+                .slice(0, 20);
+
+            const losers = nseTopMoverRows(losersResponse.data)
+                .map(normalizeNseTopMover)
+                .filter(row => row.symbol && row.pChange !== null)
+                .sort((a, b) => a.pChange - b.pChange)
+                .slice(0, 20);
+
+            const result = {
+                success: true,
+                source: "NSE",
+                index: "NIFTY 50",
+                gainers,
+                losers,
+                counts: {
+                    gainers: gainers.length,
+                    losers: losers.length
+                },
+                timestamp: new Date().toISOString()
+            };
+
+            nseTopMoversCache = {
+                timestamp: Date.now(),
+                data: result
+            };
+
+            return result;
+        } catch (error) {
+            console.error(
+                "NSE top movers fetch failed:",
+                error?.response?.status || error?.message || error
+            );
+
+            if (nseTopMoversCache.data) {
+                return { ...nseTopMoversCache.data, stale: true };
+            }
+
+            throw error;
+        } finally {
+            nseTopMoversInFlight = null;
+        }
+    })();
+
+    return nseTopMoversInFlight;
+}
+
+app.get("/api/market/nse/top-movers", async (req, res) => {
+    try {
+        const data = await fetchNseTopMovers();
+
+        res.setHeader("Cache-Control", "public, max-age=30");
+        return res.json(data);
+    } catch (error) {
+        return res.status(502).json({
+            success: false,
+            source: "NSE",
+            message:
+                error?.message ||
+                "NSE top movers are temporarily unavailable",
+            gainers: [],
+            losers: [],
+            counts: { gainers: 0, losers: 0 }
+        });
+    }
+});
+
 /* =========================================================
    START SERVER
 ========================================================= */
