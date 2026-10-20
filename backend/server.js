@@ -6345,28 +6345,11 @@ async function fetchNseTopMovers() {
                 })
             ]);
 
-
-            const nifty50Quotes = await fetchNseNifty50Quotes();
-
-            function enrichTopMover(row) {
-                const quote = nifty50Quotes[
-                    String(row.symbol || "").trim().toUpperCase()
-                ];
-
-                return {
-                    ...row,
-                    previousClose:
-                        row.previousClose ?? quote?.previousClose ?? null,
-                    volume:
-                        row.volume ?? quote?.volume ?? null
-                };
-            }
-
+            
 
 
             const gainers = nseTopMoverRows(gainersResponse?.data)
                 .map(normalizeNseTopMover)
-                .map(enrichTopMover)
                 .filter(row => row.symbol)
                 .sort((a, b) =>
                     (b.pChange ?? -Infinity) - (a.pChange ?? -Infinity)
@@ -6375,7 +6358,6 @@ async function fetchNseTopMovers() {
 
             const losers = nseTopMoverRows(losersResponse?.data)
                 .map(normalizeNseTopMover)
-                .map(enrichTopMover)
                 .filter(row => row.symbol)
                 .sort((a, b) =>
                     (a.pChange ?? Infinity) - (b.pChange ?? Infinity)
