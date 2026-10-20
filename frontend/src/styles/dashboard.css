@@ -5098,3 +5098,11 @@ footer {
 @media (prefers-reduced-motion: reduce) {
   .ema360-ticker-track { animation: none; flex-wrap: wrap; width: 100%; }
 }
+
+.ema360-top-movers-panel {
+  width: 100%;
+  position: relative;
+  z-index: 20;
+  background: #0b1220;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}

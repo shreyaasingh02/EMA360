@@ -28,13 +28,14 @@ function Header({
   // top market ticker must always use NSE data.
   const [nseHeaderQuotes, setNseHeaderQuotes] = useState({});
   const [nseHeaderIndices, setNseHeaderIndices] = useState({});
+  const [showTopMovers, setShowTopMovers] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
 
     const getApiBase = () => {
-    return import.meta.env.VITE_API_URL || "http://localhost:3000";
-};
+      return import.meta.env.VITE_API_URL || "http://localhost:3000";
+    };
 
     const loadNseHeader = async () => {
       const base = getApiBase();
@@ -81,7 +82,8 @@ function Header({
     "Markets",
     "Screeners",
     "Insider Trades",
-    "Long Deals"
+    "Long Deals",
+    "Top Movers"
   ];
 
   /*
@@ -156,171 +158,171 @@ function Header({
    */
 
   const getMarketData = (keys) => {
-  const isAngelLoggedIn =
-    !!session && session?.dataSource === "angel";
+    const isAngelLoggedIn =
+      !!session && session?.dataSource === "angel";
 
-  // =========================================================
-  // ANGEL ONE MODE
-  // Use the SAME live stockData that the main dashboard uses.
-  // =========================================================
-  if (isAngelLoggedIn) {
-    let livePrice = null;
-    let matchedStock = null;
+    // =========================================================
+    // ANGEL ONE MODE
+    // Use the SAME live stockData that the main dashboard uses.
+    // =========================================================
+    if (isAngelLoggedIn) {
+      let livePrice = null;
+      let matchedStock = null;
 
-    // Find the stock inside stockData using the header aliases
+      // Find the stock inside stockData using the header aliases
+      for (const key of keys) {
+        const upperKey = String(key).toUpperCase();
+
+        const stockKey = Object.keys(stockData || {}).find(
+          (stock) =>
+            String(stock).toUpperCase() === upperKey
+        );
+
+        if (!stockKey) continue;
+
+        const timeframeData = stockData?.[stockKey];
+
+        if (!timeframeData) continue;
+
+        // Find the newest candle from the available timeframes
+        let newestCandle = null;
+
+        for (const candles of Object.values(timeframeData)) {
+          if (!Array.isArray(candles) || !candles.length) continue;
+
+          const lastCandle = candles[candles.length - 1];
+
+          if (!lastCandle) continue;
+
+          if (
+            !newestCandle ||
+            new Date(lastCandle.time).getTime() >
+            new Date(newestCandle.time).getTime()
+          ) {
+            newestCandle = lastCandle;
+          }
+        }
+
+        if (newestCandle) {
+          livePrice = Number(newestCandle.c);
+
+          if (Number.isFinite(livePrice) && livePrice > 0) {
+            matchedStock = stockKey;
+            break;
+          }
+        }
+      }
+
+      // ---------------------------------------------------------
+      // Use the existing Angel quote only for previous close
+      // ---------------------------------------------------------
+      let quote = null;
+
+      if (matchedStock) {
+        quote =
+          marketQuotes?.[matchedStock] ||
+          marketQuotes?.[String(matchedStock).toUpperCase()] ||
+          null;
+      }
+
+      const previousClose = Number(
+        quote?.previousClose ??
+        quote?.prevClose ??
+        quote?.close ??
+        0
+      );
+
+      let change = null;
+      let percent = null;
+
+      if (
+        Number.isFinite(previousClose) &&
+        previousClose > 0 &&
+        Number.isFinite(livePrice)
+      ) {
+        change = livePrice - previousClose;
+        percent = (change / previousClose) * 100;
+      }
+
+      if (Number.isFinite(livePrice) && livePrice > 0) {
+        return {
+          price: livePrice,
+          change,
+          percent,
+          previousClose,
+        };
+      }
+
+      // IMPORTANT:
+      // Do NOT fall back to NSE while Angel is logged in.
+      return null;
+    }
+
+    // =========================================================
+    // GUEST / NSE MODE
+    // =========================================================
+    let data = null;
+
     for (const key of keys) {
       const upperKey = String(key).toUpperCase();
 
-      const stockKey = Object.keys(stockData || {}).find(
-        (stock) =>
-          String(stock).toUpperCase() === upperKey
-      );
-
-      if (!stockKey) continue;
-
-      const timeframeData = stockData?.[stockKey];
-
-      if (!timeframeData) continue;
-
-      // Find the newest candle from the available timeframes
-      let newestCandle = null;
-
-      for (const candles of Object.values(timeframeData)) {
-        if (!Array.isArray(candles) || !candles.length) continue;
-
-        const lastCandle = candles[candles.length - 1];
-
-        if (!lastCandle) continue;
-
-        if (
-          !newestCandle ||
-          new Date(lastCandle.time).getTime() >
-            new Date(newestCandle.time).getTime()
-        ) {
-          newestCandle = lastCandle;
-        }
+      if (nseHeaderQuotes?.[upperKey]) {
+        data = nseHeaderQuotes[upperKey];
+        break;
       }
 
-      if (newestCandle) {
-        livePrice = Number(newestCandle.c);
-
-        if (Number.isFinite(livePrice) && livePrice > 0) {
-          matchedStock = stockKey;
-          break;
-        }
+      if (nseHeaderIndices?.[upperKey]) {
+        data = nseHeaderIndices[upperKey];
+        break;
       }
     }
 
-    // ---------------------------------------------------------
-    // Use the existing Angel quote only for previous close
-    // ---------------------------------------------------------
-    let quote = null;
+    if (!data) return null;
 
-    if (matchedStock) {
-      quote =
-        marketQuotes?.[matchedStock] ||
-        marketQuotes?.[String(matchedStock).toUpperCase()] ||
-        null;
-    }
-
-    const previousClose = Number(
-      quote?.previousClose ??
-      quote?.prevClose ??
-      quote?.close ??
+    const price = Number(
+      data?.price ??
+      data?.ltp ??
+      data?.lastPrice ??
       0
     );
 
-    let change = null;
-    let percent = null;
+    const previousClose = Number(
+      data?.previousClose ??
+      data?.prevClose ??
+      data?.close ??
+      0
+    );
+
+    let change = Number(
+      data?.change ??
+      data?.percentChange ??
+      data?.pChange ??
+      0
+    );
+
+    let percent = Number(
+      data?.percent ??
+      data?.pChange ??
+      0
+    );
 
     if (
+      (!Number.isFinite(percent) || percent === 0) &&
       Number.isFinite(previousClose) &&
       previousClose > 0 &&
-      Number.isFinite(livePrice)
+      Number.isFinite(price)
     ) {
-      change = livePrice - previousClose;
+      change = price - previousClose;
       percent = (change / previousClose) * 100;
     }
 
-    if (Number.isFinite(livePrice) && livePrice > 0) {
-      return {
-        price: livePrice,
-        change,
-        percent,
-        previousClose,
-      };
-    }
-
-    // IMPORTANT:
-    // Do NOT fall back to NSE while Angel is logged in.
-    return null;
-  }
-
-  // =========================================================
-  // GUEST / NSE MODE
-  // =========================================================
-  let data = null;
-
-  for (const key of keys) {
-    const upperKey = String(key).toUpperCase();
-
-    if (nseHeaderQuotes?.[upperKey]) {
-      data = nseHeaderQuotes[upperKey];
-      break;
-    }
-
-    if (nseHeaderIndices?.[upperKey]) {
-      data = nseHeaderIndices[upperKey];
-      break;
-    }
-  }
-
-  if (!data) return null;
-
-  const price = Number(
-    data?.price ??
-    data?.ltp ??
-    data?.lastPrice ??
-    0
-  );
-
-  const previousClose = Number(
-    data?.previousClose ??
-    data?.prevClose ??
-    data?.close ??
-    0
-  );
-
-  let change = Number(
-    data?.change ??
-    data?.percentChange ??
-    data?.pChange ??
-    0
-  );
-
-  let percent = Number(
-    data?.percent ??
-    data?.pChange ??
-    0
-  );
-
-  if (
-    (!Number.isFinite(percent) || percent === 0) &&
-    Number.isFinite(previousClose) &&
-    previousClose > 0 &&
-    Number.isFinite(price)
-  ) {
-    change = price - previousClose;
-    percent = (change / previousClose) * 100;
-  }
-
-  return {
-    price,
-    change,
-    percent,
-    previousClose,
+    return {
+      price,
+      change,
+      percent,
+      previousClose,
+    };
   };
-};
 
   /*
    * ---------------------------------------------------------
@@ -438,6 +440,11 @@ function Header({
                   return;
                 }
 
+                if (item === "Top Movers") {
+                  setShowTopMovers(prev => !prev);
+                  return;
+                }
+
                 console.log(`${item} clicked`);
               }}
             >
@@ -527,35 +534,41 @@ function Header({
           {session ? "Login / Sign up" : "Logout"}
         </button>
 
+        {showTopMovers && (
+          <div className="ema360-top-movers-panel">
+            <NseTopMovers />
+          </div>
+        )}
+
       </div>
 
 
-      
+
       {/* =====================================================
           SCROLLING MARKET TICKER
       ===================================================== */}
 
-      
-<MarketTicker
-  stocks={stocks}
-  stockData={stockData}
-  dataVersion={dataVersion}
-  marketQuotes={
-    session?.dataSource === "angel"
-      ? marketQuotes
-      : nseHeaderQuotes
-  }
-  marketIndices={
-    session?.dataSource === "angel"
-      ? marketIndices
-      : nseHeaderIndices
-  }
-  selectedStock={selectedStock}
-  onStockChange={onStockChange}
-  session={session}
-/>
 
-<NseTopMovers />
+      <MarketTicker
+        stocks={stocks}
+        stockData={stockData}
+        dataVersion={dataVersion}
+        marketQuotes={
+          session?.dataSource === "angel"
+            ? marketQuotes
+            : nseHeaderQuotes
+        }
+        marketIndices={
+          session?.dataSource === "angel"
+            ? marketIndices
+            : nseHeaderIndices
+        }
+        selectedStock={selectedStock}
+        onStockChange={onStockChange}
+        session={session}
+      />
+
+
 
 
     </header>
