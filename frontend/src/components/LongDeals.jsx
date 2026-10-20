@@ -14,12 +14,12 @@ function LongDeals() {
 
     const getApiBase = () => {
         if (typeof window === "undefined") {
-            return "http://localhost:3000";
+            return "https://ema360-backend.onrender.com";
         }
 
         return window.location.hostname === "localhost"
             ? "http://localhost:3000"
-            : "";
+            : "https://ema360-backend.onrender.com";
     };
 
     const loadLargeDeals = async () => {
