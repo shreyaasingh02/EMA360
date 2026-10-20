@@ -5099,10 +5099,125 @@ footer {
   .ema360-ticker-track { animation: none; flex-wrap: wrap; width: 100%; }
 }
 
+
 .ema360-top-movers-panel {
-  width: 100%;
   position: relative;
-  z-index: 20;
-  background: #0b1220;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+  z-index: 100;
+  width: 100%;
+  background: #fff;
+  color: #252525;
+  border-bottom: 1px solid #ddd;
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.12);
+}
+
+.ema360-top-movers {
+  width: 100%;
+  background: #fff;
+}
+
+.ema360-movers-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-height: 42px;
+  border-bottom: 1px solid #ddd;
+}
+
+.ema360-movers-tabs button {
+  align-self: stretch;
+  padding: 0 18px;
+  border: 0;
+  border-bottom: 3px solid transparent;
+  background: transparent;
+  color: #333;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.ema360-movers-tabs button.active.gainers {
+  color: #d35400;
+  border-bottom-color: #d35400;
+}
+
+.ema360-movers-tabs button.active.losers {
+  color: #d35400;
+  border-bottom-color: #d35400;
+}
+
+.ema360-movers-source {
+  margin-left: auto;
+  padding: 0 16px;
+  color: #666;
+  font-size: 12px;
+}
+
+.ema360-movers-table-wrap {
+  width: 100%;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.ema360-movers-table {
+  width: 100%;
+  min-width: 900px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.ema360-movers-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.ema360-movers-table th {
+  padding: 9px 10px;
+  background: #3b2f83;
+  color: #fff;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.ema360-movers-table th:first-child,
+.ema360-movers-table td:first-child {
+  text-align: left;
+}
+
+.ema360-movers-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid #ddd;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.ema360-movers-table tbody tr:nth-child(even) {
+  background: #f7f7f7;
+}
+
+.ema360-movers-table tbody tr:hover {
+  background: #f0effa;
+}
+
+.ema360-movers-table .mover-symbol {
+  color: #1765a3;
+  text-decoration: underline;
+}
+
+.ema360-movers-table .mover-positive {
+  color: #138a23;
+}
+
+.ema360-movers-table .mover-negative {
+  color: #d93025;
+}
+
+.ema360-movers-table .mover-empty,
+.ema360-movers-message {
+  padding: 20px;
+  text-align: center;
+  color: #555;
+}
+
+.ema360-movers-message.error {
+  color: #c62828;
 }

@@ -6195,51 +6195,71 @@ function nseTopMoverRows(payload) {
     return [];
 }
 
+
 function normalizeNseTopMover(row = {}) {
-    const num = (...values) => {
-        for (const value of values) {
-            if (value === null || value === undefined || value === "") continue;
+  const num = (...values) => {
+    for (const value of values) {
+      if (value === null || value === undefined || value === "") continue;
 
-            const n = Number(
-                String(value).replace(/,/g, "").replace(/%/g, "").trim()
-            );
+      const n = Number(
+        String(value).replace(/,/g, "").replace(/%/g, "").trim()
+      );
 
-            if (Number.isFinite(n)) return n;
-        }
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  };
 
-        return null;
-    };
+  return {
+    symbol: String(row.symbol ?? row.SYMBOL ?? row.symbolName ?? "").trim(),
 
-    return {
-        symbol: String(
-            row.symbol ?? row.SYMBOL ?? row.symbolName ?? ""
-        ).trim(),
+    open: num(row.open, row.OPEN, row.openPrice),
+    high: num(row.high, row.HIGH, row.dayHigh, row.highPrice),
+    low: num(row.low, row.LOW, row.dayLow, row.lowPrice),
 
-        ltp: num(row.ltp, row.LTP, row.lastPrice, row.last_price),
+    previousClose: num(
+      row.previousClose,
+      row.prevClose,
+      row.prev_close,
+      row.PREV_CLOSE,
+      row.previousPrice
+    ),
 
-        change: num(
-            row.net_price,
-            row.netPrice,
-            row.change,
-            row.CHANGE
-        ),
+    ltp: num(row.ltp, row.LTP, row.lastPrice, row.last_price),
 
-        pChange: num(
-            row.perChange,
-            row.pChange,
-            row.pchange,
-            row.percentChange,
-            row["%CHNG"]
-        ),
+    change: num(
+      row.net_price,
+      row.netPrice,
+      row.change,
+      row.CHANGE
+    ),
 
-        volume: num(
-            row.traded_quantity,
-            row.quantityTraded,
-            row.volume,
-            row.VOLUME
-        )
-    };
+    pChange: num(
+      row.perChange,
+      row.pChange,
+      row.pchange,
+      row.percentChange,
+      row["%CHNG"]
+    ),
+
+    volume: num(
+      row.traded_quantity,
+      row.quantityTraded,
+      row.volume,
+      row.VOLUME
+    ),
+
+    value: num(
+      row.value,
+      row.VALUE,
+      row.turnover,
+      row.totalTradedValue
+    ),
+
+    ca: row.ca ?? row.CA ?? row.corporateAction ?? null
+  };
 }
+
 
 async function fetchNseTopMovers() {
     const now = Date.now();

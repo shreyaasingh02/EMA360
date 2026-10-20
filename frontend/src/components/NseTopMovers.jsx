@@ -1,233 +1,196 @@
 
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 
 const API_BASE =
-    (import.meta.env.VITE_API_URL || "").trim().replace(/\/+$/, "") ||
-    (window.location.hostname === "localhost"
-        ? "http://localhost:3000"
-        : "https://ema360-backend.onrender.com");
+  (import.meta.env.VITE_API_URL || "").trim().replace(/\/+$/, "") ||
+  (window.location.hostname === "localhost"
+    ? "http://localhost:3000"
+    : "https://ema360-backend.onrender.com");
 
-const formatPrice = value => {
-    const n = Number(value);
-    return Number.isFinite(n)
-        ? n.toLocaleString("en-IN", {
-              minimumFractionDigits: 2,
-              maximumFractionDigits: 2
-          })
-        : "—";
-};
+const columns = [
+  ["symbol", "SYMBOL"],
+  ["open", "OPEN"],
+  ["high", "HIGH"],
+  ["low", "LOW"],
+  ["previousClose", "PREV. CLOSE"],
+  ["ltp", "LTP"],
+  ["pChange", "%CHNG"],
+  ["volume", "VOLUME (Shares)"],
+  ["value", "VALUE (₹ Lakhs)"],
+  ["ca", "CA"]
+];
 
-const formatPercent = value => {
-    const n = Number(value);
-    return Number.isFinite(n)
-        ? `${n > 0 ? "+" : ""}${n.toFixed(2)}%`
-        : "—";
-};
+function formatNumber(value, decimals = 2) {
+  if (value === null || value === undefined || value === "") return "—";
+
+  const number = Number(value);
+  if (!Number.isFinite(number)) return value;
+
+  return number.toLocaleString("en-IN", {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals
+  });
+}
 
 export default function NseTopMovers() {
-    const [data, setData] = useState({
-        gainers: [],
-        losers: []
-    });
+  const [activeTab, setActiveTab] = useState("gainers");
+  const [data, setData] = useState({ gainers: [], losers: [] });
+  const [status, setStatus] = useState("loading");
 
-    const [status, setStatus] = useState("loading");
+  useEffect(() => {
+    let active = true;
 
-    useEffect(() => {
-        let alive = true;
-
-        const loadMovers = async () => {
-            try {
-                const response = await fetch(
-                    `${API_BASE}/api/market/nse/top-movers`
-                );
-
-                if (!response.ok) {
-                    throw new Error(`API error: ${response.status}`);
-                }
-
-                const json = await response.json();
-
-                if (!json.success) {
-                    throw new Error(json.message || "NSE data unavailable");
-                }
-
-                if (!alive) return;
-
-                const next = {
-                    gainers: Array.isArray(json.gainers)
-                        ? json.gainers
-                        : [],
-                    losers: Array.isArray(json.losers)
-                        ? json.losers
-                        : []
-                };
-
-                setData(next);
-                setStatus(
-                    next.gainers.length || next.losers.length
-                        ? "ready"
-                        : "empty"
-                );
-            } catch (error) {
-                console.error("NSE top movers:", error);
-
-                if (alive) setStatus("error");
-            }
-        };
-
-        loadMovers();
-
-        const timer = window.setInterval(loadMovers, 60000);
-
-        return () => {
-            alive = false;
-            window.clearInterval(timer);
-        };
-    }, []);
-
-    const items = useMemo(
-        () => [
-            ...data.gainers.map(item => ({
-                ...item,
-                side: "Gainer"
-            })),
-            ...data.losers.map(item => ({
-                ...item,
-                side: "Loser"
-            }))
-        ],
-        [data]
-    );
-
-    const shell = {
-        width: "100%",
-        minWidth: 0,
-        overflow: "hidden",
-        display: "flex",
-        alignItems: "center",
-        gap: 12,
-        padding: "8px 0",
-        background: "var(--ema360-movers-bg, #0b1220)",
-        borderTop: "1px solid rgba(148,163,184,.16)",
-        borderBottom: "1px solid rgba(148,163,184,.16)",
-        color: "#e5e7eb",
-        fontSize: 12
-    };
-
-    if (status !== "ready" || !items.length) {
-        return (
-            <div style={shell}>
-                <strong style={{ padding: "0 12px", whiteSpace: "nowrap" }}>
-                    NSE · NIFTY 50
-                </strong>
-                <span>
-                    {status === "loading"
-                        ? "Loading NSE movers…"
-                        : status === "error"
-                        ? "NSE movers temporarily unavailable"
-                        : "No NSE mover data returned"}
-                </span>
-            </div>
+    async function loadMovers() {
+      try {
+        const response = await fetch(
+          `${API_BASE}/api/market/nse/top-movers`,
+          { cache: "no-store" }
         );
+
+        if (!response.ok) {
+          throw new Error(`API error ${response.status}`);
+        }
+
+        const json = await response.json();
+        if (!json.success) {
+          throw new Error(json.message || "NSE data unavailable");
+        }
+
+        if (!active) return;
+
+        const next = {
+          gainers: Array.isArray(json.gainers) ? json.gainers : [],
+          losers: Array.isArray(json.losers) ? json.losers : []
+        };
+
+        setData(next);
+        setStatus("ready");
+      } catch (error) {
+        console.error("NSE Top Movers error:", error);
+        if (active) setStatus("error");
+      }
     }
 
-    return (
-        <div style={shell} aria-label="NSE NIFTY 50 gainers and losers">
-            <style>{`
-                @keyframes ema360TopMoversScroll {
-                    from { transform: translateX(0); }
-                    to { transform: translateX(-50%); }
-                }
+    loadMovers();
+    const timer = window.setInterval(loadMovers, 60000);
 
-                .ema360-top-movers-viewport:hover
-                .ema360-top-movers-track {
-                    animation-play-state: paused;
-                }
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
 
-                @media (prefers-reduced-motion: reduce) {
-                    .ema360-top-movers-track {
-                        animation: none !important;
-                    }
-                }
-            `}</style>
+  const rows = data[activeTab];
 
-            <strong
-                style={{
-                    padding: "0 12px",
-                    color: "#94a3b8",
-                    whiteSpace: "nowrap"
-                }}
-            >
-                NSE · NIFTY 50
-            </strong>
+  return (
+    <section className="ema360-top-movers">
+      <div className="ema360-movers-tabs">
+        <button
+          type="button"
+          className={activeTab === "gainers" ? "active gainers" : ""}
+          onClick={() => setActiveTab("gainers")}
+        >
+          GAINERS
+        </button>
 
-            <div
-                className="ema360-top-movers-viewport"
-                style={{
-                    minWidth: 0,
-                    overflow: "hidden",
-                    flex: "1 1 auto"
-                }}
-            >
-                <div
-                    className="ema360-top-movers-track"
-                    style={{
-                        display: "flex",
-                        width: "max-content",
-                        alignItems: "center",
-                        animation:
-                            "ema360TopMoversScroll 95s linear infinite"
-                    }}
-                >
-                    {[...items, ...items].map((item, index) => {
-                        const positive = Number(item.pChange) >= 0;
+        <button
+          type="button"
+          className={activeTab === "losers" ? "active losers" : ""}
+          onClick={() => setActiveTab("losers")}
+        >
+          LOSERS
+        </button>
 
-                        return (
-                            <div
-                                key={`${item.side}-${item.symbol}-${index}`}
-                                style={{
-                                    display: "inline-flex",
-                                    alignItems: "center",
-                                    gap: 7,
-                                    padding: "0 18px",
-                                    whiteSpace: "nowrap",
-                                    borderRight:
-                                        "1px solid rgba(148,163,184,.16)"
-                                }}
-                            >
-                                <span
-                                    style={{
-                                        color:
-                                            item.side === "Gainer"
-                                                ? "#22c55e"
-                                                : "#f87171"
-                                    }}
-                                >
-                                    {item.side === "Gainer" ? "▲" : "▼"}
-                                </span>
+        <span className="ema360-movers-source">NSE · NIFTY 50</span>
+      </div>
 
-                                <strong style={{ color: "#f8fafc" }}>
-                                    {item.symbol}
-                                </strong>
-
-                                <span style={{ color: "#94a3b8" }}>
-                                    ₹{formatPrice(item.ltp)}
-                                </span>
-
-                                <strong
-                                    style={{
-                                        color: positive
-                                            ? "#22c55e"
-                                            : "#f87171"
-                                    }}
-                                >
-                                    {formatPercent(item.pChange)}
-                                </strong>
-                            </div>
-                        );
-                    })}
-                </div>
-            </div>
+      {status === "loading" && (
+        <div className="ema360-movers-message">
+          Loading NSE market data…
         </div>
-    );
+      )}
+
+      {status === "error" && (
+        <div className="ema360-movers-message error">
+          Unable to load NSE data. Check the backend API response.
+        </div>
+      )}
+
+      {status === "ready" && (
+        <div className="ema360-movers-table-wrap">
+          <table className="ema360-movers-table">
+            <thead>
+              <tr>
+                {columns.map(([key, label]) => (
+                  <th key={key}>{label}</th>
+                ))}
+              </tr>
+            </thead>
+
+            <tbody>
+              {rows.map((row, index) => {
+                const change = Number(row.pChange);
+                const positive = change >= 0;
+
+                return (
+                  <tr key={`${row.symbol}-${index}`}>
+                    {columns.map(([key]) => {
+                      const value = row[key];
+
+                      if (key === "symbol") {
+                        return (
+                          <td key={key} className="mover-symbol">
+                            {value || "—"}
+                          </td>
+                        );
+                      }
+
+                      if (key === "pChange") {
+                        return (
+                          <td
+                            key={key}
+                            className={positive ? "mover-positive" : "mover-negative"}
+                          >
+                            {Number.isFinite(change)
+                              ? `${change > 0 ? "+" : ""}${change.toFixed(2)}%`
+                              : "—"}
+                          </td>
+                        );
+                      }
+
+                      if (key === "volume") {
+                        return (
+                          <td key={key}>
+                            {formatNumber(value, 0)}
+                          </td>
+                        );
+                      }
+
+                      if (key === "ca") {
+                        return <td key={key}>{value || "—"}</td>;
+                      }
+
+                      return (
+                        <td key={key}>
+                          {formatNumber(value, 2)}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+
+              {rows.length === 0 && (
+                <tr>
+                  <td colSpan={columns.length} className="mover-empty">
+                    No rows returned by the NSE API.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
 }
