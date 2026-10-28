@@ -6287,14 +6287,10 @@ function normalizeNseTopMover(row = {}) {
         volume: pick(
             row.traded_quantity,
             row.tradedQuantity,
-            row.tradedQty,
             row.quantityTraded,
             row.totalTradedQty,
             row.totalTradedVolume,
-            row.totalTradedQuantity,
             row.tradedVolume,
-            row.tradeVolume,
-            row.volumeTraded,
             row.volume,
             row.VOLUME
         ),
@@ -6316,51 +6312,6 @@ function normalizeNseTopMover(row = {}) {
 }
 
 
-// NSE's variations endpoint often omits volume. The dedicated equity quote
-// endpoint exposes it under marketDeptOrderBook.tradeInfo.totalTradedVolume.
-function readNseEquityVolume(payload) {
-    const candidates = [
-        payload?.marketDeptOrderBook?.tradeInfo?.totalTradedVolume,
-        payload?.marketDeptOrderBook?.tradeInfo?.totalTradedQty,
-        payload?.securityWiseDP?.quantityTraded,
-        payload?.securityWiseDP?.totalTradedVolume,
-        payload?.priceInfo?.totalTradedVolume,
-        payload?.totalTradedVolume,
-        payload?.traded_quantity,
-        payload?.tradedQuantity,
-        payload?.quantityTraded,
-        payload?.volume
-    ];
-    for (const value of candidates) {
-        if (value === null || value === undefined || value === "" || value === "-") continue;
-        const number = Number(String(value).replace(/,/g, "").trim());
-        if (Number.isFinite(number) && number >= 0) return number;
-    }
-    return null;
-}
-
-async function fillMissingNseMoverVolumes(rows) {
-    const missing = rows.filter(row => row.symbol && row.volume == null);
-    let cursor = 0;
-    const workers = Array.from({ length: Math.min(4, missing.length) }, async () => {
-        while (cursor < missing.length) {
-            const row = missing[cursor++];
-            const symbol = String(row.symbol).trim().replace(/[-_](EQ|BE|BZ|SM)$/i, "");
-            try {
-                const response = await axios.get(
-                    `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(symbol)}`,
-                    { headers: nseTopMoversHeaders(), timeout: 8000 }
-                );
-                const volume = readNseEquityVolume(response?.data);
-                if (volume != null) row.volume = volume;
-            } catch (error) {
-                console.warn(`NSE volume lookup failed for ${symbol}:`, error?.response?.status || error?.message || error);
-            }
-        }
-    });
-    await Promise.all(workers);
-    return rows;
-}
 
 async function fetchNseTopMovers() {
     const now = Date.now();
@@ -6397,35 +6348,8 @@ async function fetchNseTopMovers() {
             
 
 
-            // The variations endpoint may omit traded volume for some rows.
-            // Enrich missing values from NSE's official NIFTY 50 quote table,
-            // but never let a quote refresh failure break gainers/losers.
-            let nifty50Quotes = {};
-            try {
-                nifty50Quotes = await fetchNseNifty50Quotes();
-            } catch (quoteError) {
-                console.warn(
-                    "NSE quote enrichment unavailable; returning Top Movers without fallback volume:",
-                    quoteError?.message || quoteError
-                );
-            }
-
-            function enrichNseTopMover(row) {
-                const symbol = String(row.symbol || "")
-                    .trim()
-                    .toUpperCase()
-                    .replace(/[-_](EQ|BE|BZ|SM)$/i, "");
-                const quote = nifty50Quotes[symbol] || {};
-                return {
-                    ...row,
-                    previousClose: row.previousClose ?? quote.previousClose ?? null,
-                    volume: row.volume ?? quote.volume ?? null
-                };
-            }
-
             const gainers = nseTopMoverRows(gainersResponse?.data)
                 .map(normalizeNseTopMover)
-                .map(enrichNseTopMover)
                 .filter(row => row.symbol)
                 .sort((a, b) =>
                     (b.pChange ?? -Infinity) - (a.pChange ?? -Infinity)
@@ -6434,24 +6358,12 @@ async function fetchNseTopMovers() {
 
             const losers = nseTopMoverRows(losersResponse?.data)
                 .map(normalizeNseTopMover)
-                .map(enrichNseTopMover)
                 .filter(row => row.symbol)
                 .sort((a, b) =>
                     (a.pChange ?? Infinity) - (b.pChange ?? Infinity)
                 )
                 .slice(0, 20);
 
-            // Do a direct NSE quote lookup for rows still missing volume.
-            // This is deliberately after the top-20 slice to avoid unnecessary requests.
-            await Promise.all([
-                fillMissingNseMoverVolumes(gainers),
-                fillMissingNseMoverVolumes(losers)
-            ]);
-
-            console.info("NSE top movers volume coverage:", {
-                gainers: `${gainers.filter(row => row.volume != null).length}/${gainers.length}`,
-                losers: `${losers.filter(row => row.volume != null).length}/${losers.length}`
-            });
 
             const result = {
                 success: true,
