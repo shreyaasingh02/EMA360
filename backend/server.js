@@ -6287,14 +6287,10 @@ function normalizeNseTopMover(row = {}) {
         volume: pick(
             row.traded_quantity,
             row.tradedQuantity,
-            row.tradedQty,
             row.quantityTraded,
             row.totalTradedQty,
             row.totalTradedVolume,
-            row.totalTradedQuantity,
             row.tradedVolume,
-            row.tradeVolume,
-            row.volumeTraded,
             row.volume,
             row.VOLUME
         ),
@@ -6352,35 +6348,8 @@ async function fetchNseTopMovers() {
             
 
 
-            // The variations endpoint may omit traded volume for some rows.
-            // Enrich missing values from NSE's official NIFTY 50 quote table,
-            // but never let a quote refresh failure break gainers/losers.
-            let nifty50Quotes = {};
-            try {
-                nifty50Quotes = await fetchNseNifty50Quotes();
-            } catch (quoteError) {
-                console.warn(
-                    "NSE quote enrichment unavailable; returning Top Movers without fallback volume:",
-                    quoteError?.message || quoteError
-                );
-            }
-
-            function enrichNseTopMover(row) {
-                const symbol = String(row.symbol || "")
-                    .trim()
-                    .toUpperCase()
-                    .replace(/[-_](EQ|BE|BZ|SM)$/i, "");
-                const quote = nifty50Quotes[symbol] || {};
-                return {
-                    ...row,
-                    previousClose: row.previousClose ?? quote.previousClose ?? null,
-                    volume: row.volume ?? quote.volume ?? null
-                };
-            }
-
             const gainers = nseTopMoverRows(gainersResponse?.data)
                 .map(normalizeNseTopMover)
-                .map(enrichNseTopMover)
                 .filter(row => row.symbol)
                 .sort((a, b) =>
                     (b.pChange ?? -Infinity) - (a.pChange ?? -Infinity)
@@ -6389,7 +6358,6 @@ async function fetchNseTopMovers() {
 
             const losers = nseTopMoverRows(losersResponse?.data)
                 .map(normalizeNseTopMover)
-                .map(enrichNseTopMover)
                 .filter(row => row.symbol)
                 .sort((a, b) =>
                     (a.pChange ?? Infinity) - (b.pChange ?? Infinity)
