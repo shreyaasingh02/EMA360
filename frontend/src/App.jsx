@@ -569,31 +569,7 @@ function MarketApp({ session, onLogout }) {
 
 
 
-    useEffect(
-
-
-
-        () => {
-
-
-
-            loadAllStockData();
-
-
-
-        },
-
-
-
-        [
-
-
-
-        ]
-
-
-
-    );
+    
 
 
 
