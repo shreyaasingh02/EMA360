@@ -5287,3 +5287,249 @@ footer {
 .ema360-movers-table .mover-symbol {
     color: #1765a3;
 }
+
+/* ==========================================================
+   EMA360 MOBILE RESPONSIVENESS PATCH
+   Appended overrides: desktop layout remains unchanged.
+   ========================================================== */
+html {
+    width: 100%;
+    min-width: 0;
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+}
+
+body {
+    width: 100%;
+    min-width: 0;
+    overflow-x: hidden;
+}
+
+img, svg, canvas, video, iframe {
+    max-width: 100%;
+}
+
+input, select, textarea, button {
+    max-width: 100%;
+    font: inherit;
+}
+
+/* Keep wide data tables usable on phones instead of breaking the page. */
+.table-wrap,
+.table-container,
+.table-responsive,
+.table-scroll,
+.chart-table-wrap,
+.long-deals-table-wrap,
+.ema360-movers-table-wrap,
+.ema360-ticker,
+.market-table-wrap,
+.watchlist-table-wrap {
+    max-width: 100%;
+    min-width: 0;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+}
+
+table {
+    max-width: 100%;
+}
+
+@media (max-width: 768px) {
+    header {
+        position: sticky;
+        padding: 10px 12px;
+        align-items: flex-start;
+        flex-wrap: wrap;
+        gap: 10px;
+    }
+
+    header > * {
+        min-width: 0;
+        max-width: 100%;
+    }
+
+    .logo {
+        font-size: clamp(20px, 5vw, 25px);
+    }
+
+    .controls {
+        width: 100%;
+        gap: 7px;
+    }
+
+    .controls select,
+    .controls button {
+        min-height: 38px;
+        flex: 1 1 auto;
+    }
+
+    main,
+    .main,
+    .container,
+    .dashboard,
+    .dashboard-container,
+    .content,
+    .page-content {
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        padding-left: 10px;
+        padding-right: 10px;
+    }
+
+    .grid,
+    .dashboard-grid,
+    .cards-grid,
+    .market-grid,
+    .stats-grid,
+    .charts-grid,
+    .panels-grid {
+        grid-template-columns: minmax(0, 1fr) !important;
+        min-width: 0;
+    }
+
+    .card,
+    .panel,
+    .market-card,
+    .chart-card,
+    .widget,
+    .ema360-top-movers,
+    .ema360-top-movers-panel {
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+    }
+
+    .row,
+    .toolbar,
+    .filter-row,
+    .chart-toolbar,
+    .panel-header,
+    .section-header {
+        flex-wrap: wrap;
+        min-width: 0;
+        gap: 8px;
+    }
+
+    .row > *,
+    .toolbar > *,
+    .filter-row > *,
+    .chart-toolbar > * {
+        min-width: 0;
+        max-width: 100%;
+    }
+
+    input, select, textarea {
+        min-width: 0;
+    }
+
+    button {
+        min-height: 36px;
+        touch-action: manipulation;
+    }
+
+    .ema360-movers-table {
+        min-width: 900px;
+        font-size: 11px;
+    }
+
+    .ema360-movers-table th,
+    .ema360-movers-table td {
+        padding: 8px;
+    }
+
+    .long-deals-table {
+        min-width: 760px;
+    }
+
+    canvas {
+        max-width: 100% !important;
+    }
+}
+
+@media (max-width: 520px) {
+    header {
+        padding: 9px 10px;
+    }
+
+    .controls {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .controls > * {
+        width: 100%;
+        min-width: 0;
+    }
+
+    main,
+    .main,
+    .container,
+    .dashboard,
+    .dashboard-container,
+    .content,
+    .page-content {
+        padding-left: 8px;
+        padding-right: 8px;
+    }
+
+    h1 { font-size: clamp(21px, 6vw, 30px); }
+    h2 { font-size: clamp(18px, 5vw, 24px); }
+    h3 { font-size: clamp(16px, 4.5vw, 20px); }
+
+    .ema360-movers-tabs {
+        display: flex;
+        width: 100%;
+        gap: 6px;
+    }
+
+    .ema360-movers-tabs button {
+        flex: 1 1 0;
+        min-width: 0;
+        padding: 9px 6px;
+        white-space: normal;
+    }
+
+    .ema360-movers-source {
+        overflow-wrap: anywhere;
+    }
+
+    .login-page {
+        min-height: 100dvh;
+        padding: 16px 12px;
+    }
+
+    .login-card {
+        width: 100%;
+        max-width: 440px;
+        padding: 20px 16px;
+    }
+
+    .login-header h1 {
+        font-size: 25px;
+    }
+
+    .connection-card {
+        padding: 13px;
+    }
+
+    .ema360-ticker-item {
+        flex-shrink: 0;
+    }
+}
+
+@media (max-width: 360px) {
+    .controls {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .login-card {
+        padding: 17px 12px;
+    }
+
+    .ema360-movers-table {
+        min-width: 820px;
+    }
+}
