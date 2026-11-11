@@ -1,154 +1,78 @@
-⭐ EMA360 — Intelligent Trading & Market Analysis Dashboard
+# ⭐ EMA360 – Intelligent Trading & Market Analysis Dashboard
 
-EMA360 is a full-stack web-based trading and market analysis dashboard designed to provide a centralized interface for monitoring the Indian stock market, analyzing market data, visualizing price movements, and managing trading-related information.
+**A Unified Dashboard for Smarter Market Analysis & Trading Workflows.**
 
-The project combines a modern React frontend with a Node.js/Express backend and integrates real-time market data through Angel One SmartAPI.
+EMA360 is a full-stack web-based trading and market analysis dashboard designed to help users monitor the Indian stock market, analyze price movements, discover trading opportunities, and manage trading activities through a centralized interface.
 
-> ⚠️ Disclaimer: EMA360 is a software/educational project for market-data visualization and trading workflow experimentation. It does not provide financial advice or guarantee trading profits.
+It integrates **Angel One SmartAPI and NSE market data**, providing two access modes: authenticated market-data access through Angel One and Guest Mode access using NSE data.
 
- 
+## 🚀 Live Demo
 
-🚀 Project Overview
+**Explore EMA360:** [Open Live Application](https://ema360-frontend.onrender.com)
 
-EMA360 is built to bring multiple parts of a trader's workflow into a single dashboard.
+*Note: Market data availability depends on the selected data source, authentication, and market hours.*
 
-Instead of switching between different interfaces for market prices, charts, indicators, trade inputs, and trade history, EMA360 provides a unified workspace.
+## ✨ Key Features
 
-The application focuses on:
+- **🔐 Dual Data Access:** Connect through Angel One SmartAPI or explore available market information using NSE data in Guest Mode.
+- **📊 Market Dashboard:** Monitor selected stocks, indices, prices, market movements, and other market statistics.
+- **🔍 Stock Screener:** Explore and filter supported stocks to identify potential trading opportunities.
+- **📈 Trading Charts:** Visualize price movements through candlestick charts, historical data, and multiple time intervals.
+- **📐 Technical Analysis:** Work with indicators and trading levels such as EMA, VWAP, targets, and stop-loss.
+- **💹 Long Deals:** Explore and manage long-side trading opportunities through a dedicated interface.
+- **💰 Trade Management:** Manage Buy/Sell entries, entry and exit prices, targets, stop-losses, and profit/loss calculations.
+- **📋 Active Trades:** Monitor and manage currently active trades through an organized table.
+- **🗂️ Trade History:** Review completed trades and their historical performance.
+- **🔄 Dynamic State Management:** Maintain independent stock selections and synchronized dashboard components.
 
-- 📊 Live market data
-- 📈 Price and chart visualization
-- 📉 Technical analysis
-- 🔄 Dynamic stock selection
-- 💹 Trading workflow management
-- 🧮 Market and trade calculations
-- 🗂️ Active and historical trade tracking
-- 🔐 Secure API credential management
-- ⚡ Full-stack real-time data flow
+## 🛠️ Tech Stack
 
- 
+| Technology | Purpose |
+|---|---|
+| React.js | Frontend development |
+| JavaScript | Application logic |
+| Node.js | Backend runtime |
+| Express.js | Backend API |
+| Angel One SmartAPI | Authenticated market-data integration |
+| NSE Data | Guest-mode market-data source |
+| REST APIs | Frontend-backend communication |
+| Render | Deployment and hosting |
 
-✨ Key Features
+## ⚙️ How It Works
 
-📊 Market Data Dashboard
+1. Users access EMA360 through its deployed web application.
+2. They choose Angel One authentication or Guest Mode.
+3. The backend retrieves market information from the configured data source.
+4. Users explore charts, screen stocks, and analyze market movements.
+5. Trading interfaces help organize long deals, active trades, and historical records.
 
-EMA360 displays dynamically updated market information for selected instruments.
+## 📸 Application Preview
 
-The market dashboard is designed to provide information such as:
+<img width="1895" height="912" alt="image" src="https://github.com/user-attachments/assets/06cd5a39-7cb9-481e-a255-23ccd2de2c23" />
+<img width="1479" height="705" alt="image" src="https://github.com/user-attachments/assets/6f0314b9-9758-44a0-acea-f5fdf1b8778c" />
 
-- Instrument name
-- Current price
-- Price movement
-- Market status
-- Market-related statistics
-- Selected stock/index information
+## 🎯 Project Highlights
 
-The dashboard is designed around NSE market data while using Angel One SmartAPI as the market-data source when authenticated.
+- Integration with external market-data APIs.
+- Full-stack application development.
+- Dynamic and interactive dashboard design.
+- Technical-analysis and financial calculations.
+- Frontend state management across multiple components.
+- Backend API development and cloud deployment.
 
- 
+## ⚠️ Disclaimer
 
-📈 Dynamic Stock Selection
+EMA360 is a software and educational project developed for market-data visualization, technical analysis, and trading-workflow experimentation. It does not provide financial advice or guarantee trading profits.
 
-Users can select different supported stocks/instruments from the dashboard.
+## 👩‍💻 Author
 
-When the selected instrument changes, the relevant:
+**Shreya**  
+B.Tech – Computer Science & Engineering
 
-- Market card
-- Main instrument heading
-- Price information
-- Chart
-- Trading information
+Interested in full-stack development, financial technology, and building practical software solutions.
 
-are updated accordingly.
+---
 
-The architecture separates the **currently selected dashboard instrument** from manually selected instruments used in different trading/input sections.
+⭐ If you find EMA360 interesting, consider giving this repository a star!
 
- 
-
-📉 Trading Chart
-
-EMA360 includes a TradingView-inspired market chart interface.
-
-The chart is designed to display:
-
-- Candlestick data
-- Historical price movement
-- Multiple time intervals
-- Dynamic stock selection
-- Price visualization
-- Technical-analysis related information
-
-The project is structured so that market candle data can be received from the backend rather than relying on manually created/fake market values.
-
- 
-
-📐 Technical Analysis
-
-EMA360 includes technical-analysis functionality used for understanding price behaviour.
-
-The dashboard can work with market-derived values such as:
-
-- EMA
-- VWAP
-- Price levels
-- Target levels
-- Stop-loss levels
-- Profit/Loss calculations
-
-These calculations are integrated into the trading workflow rather than being isolated calculations.
-
- 
-
-💰 Trade Management
-
-The application includes an active trade management interface.
-
-The workflow supports concepts such as:
-
-- Buy
-- Sell
-- Entry price
-- Exit price
-- Target levels
-- Stop-loss
-- Profit/Loss
-- Trade status
-- Editing trade information
-- Exiting trades
-
-The dashboard separates currently active trades from historical trades so that the current trading state remains easy to monitor.
-
- 
- 
-📋 Active Trade Table
-
-EMA360 maintains an active-trade section where currently relevant trades can be displayed.
-
-The interface is designed around a limited active-trade workflow, with trades moving into historical records when they are completed or displaced according to the dashboard's trade-management logic.
-
- 
-
-🗃️ Trade History
-
-Completed trades can be moved into a historical table.
-
-The history section provides a way to review previously completed trading activity without mixing it with currently active trades.
-
-The interface also supports managing a larger history through a compact table/view system.
-
- 
-
-🔄 Dynamic Dashboard State
-
-One of the important design goals of EMA360 is keeping different parts of the dashboard synchronized without unintentionally changing unrelated selections.
-
-For example:
-
-- The main dashboard stock can change independently.
-- The input/trading stock can be selected independently.
-- Changing an input selection should not unexpectedly overwrite the dashboard selection.
-- Market cards should reflect the appropriate selected instrument.
-- Chart data should correspond to the instrument being displayed.
-
-This state-management separation is an important part of the frontend architecture.
-
+**Built with ❤️ to make market analysis more accessible.**
